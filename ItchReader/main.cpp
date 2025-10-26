@@ -14,9 +14,18 @@
 #include <algorithm>
 #include <unordered_map>
 #include <array>
+#include <atomic>
+#include <thread>
 
+enum ReadType {
+    deserialize,
+    packed,
+    threaded
+};
 
-constexpr bool deserialize = true;
+//constexpr ReadType readType = packed;
+constexpr ReadType readType = threaded;
+
 
 //
 //struct Int32Buffer {
@@ -61,7 +70,7 @@ template<typename T, typename R>
 R bigEndianRead(const T& buf) {
     R price = 0;
     using std::ranges::views::iota;
-    for (auto j : iota(0, buf.size())) {
+    for (auto j : iota(0, (int)buf.size())) {
         int h = buf[j] & 0x0ff;
         //h &= 255;
         price <<= 8;
@@ -154,6 +163,7 @@ public:
         return bigEndianRead<Field, R>(field);
     }
 
+    static constexpr int getOffset(Fields fieldId) { return offsets[fieldId]; }
 public:
     int16_t getSymbolLocate() {
         return get<int16_t>(Fields::symbolLocate);
@@ -168,8 +178,15 @@ public:
     }
 };
 
-
-struct __attribute__((packed)) TradeMessage {
+// as per https://stackoverflow.com/questions/1537964/visual-c-equivalent-of-gccs-attribute-packed
+#ifdef _MSC_VER
+__pragma(pack(push, 1)) // MSVC
+#endif
+struct 
+#ifdef __GNUC__
+    __attribute__((packed)) // Clang
+#endif
+    TradeMessage {
     char type;
     // char unused[44 - 8 - 4 - 8 - 4 - 1 - 8 - 6 - 2 - 2 - 1];
     BigEndian<CharBuffer<2>, int16_t> symbolLocate;
@@ -182,7 +199,9 @@ struct __attribute__((packed)) TradeMessage {
     BigEndian<Int32Buffer, int32_t> price;
     BigEndian<CharBuffer<8>, int64_t> matchId;
 };
-
+#ifdef _MSC_VER
+__pragma(pack(pop)) // MSVC
+#endif
 
 
 
@@ -211,13 +230,45 @@ int main(int argc, const char * argv[]) {
         char b[2];
     } u16;
     char buf[1024];
-    int counts[256];
+    int counts[256]{};
     std::string_view ticker = "GOOG    ";
-    std::vector<long> durations;
+    std::vector<int64_t> durations;
     //int got = 0;
     for (int i : iota(0, 256)) counts[i] = 0;
     int tslas = 0;
-    double totalValueTraded = 0;
+    std::atomic<double> totalValueTraded = 0;
+    constexpr int calcBufferSize = 1024;
+    std::array<std::array<char, 4>, calcBufferSize> prices;
+    //char prices[calcBufferSize][4];
+    std::array<std::array<char, 4>, calcBufferSize> volumes;
+    struct {
+        std::atomic<int> produced;
+        std::atomic<int> consumed;
+        std::atomic<bool> done;
+    } work{0, 0, readType != threaded};
+    std::jthread worker([&]() {
+            double threadTotalValueTraded = 0;
+            using namespace std::literals;
+            cout << "worker thread started" << endl;
+            int consumed = 0;
+            while (!work.done.load()) {
+                int produced = work.produced.load();
+                //int consumed = work.consumed.load();
+                //cout << produced << " vs " << consumed << endl;
+                if (consumed < produced) {
+                    int32_t price = bigEndianRead<std::array<char, 4>, int32_t>(prices[consumed % calcBufferSize]);
+                    int32_t volume = bigEndianRead<std::array<char, 4>, int32_t>(volumes[consumed % calcBufferSize]);
+                    //work.consumed.fetch_add(1);
+                    ++consumed;
+                    //cout << consumed << ": " << price << " * " << volume << endl;
+                    threadTotalValueTraded += price * volume;
+                } else {
+                    std::this_thread::sleep_for(1ms);
+                }
+            }
+            cout << "worker thread ended" << endl;
+            totalValueTraded.store(threadTotalValueTraded);
+        });
     for (int i : iota(0, 1e9)) {
         u16.n = 0;
         if (!f.good()) break;
@@ -241,7 +292,7 @@ int main(int argc, const char * argv[]) {
                 auto start = steady_clock::now();
                 
                 int price = 0, volume = 0, trackingNumber = 0;
-                if constexpr (deserialize) {
+                if constexpr (readType == deserialize) {
                     TradeMessageLayout layout(buf);
 //                    Int32BufferOffset bufferOffset(buf, 44 - 8 - 4);
 //                    BigEndian<Int32BufferOffset, int32_t> priceReader(bufferOffset);
@@ -254,15 +305,26 @@ int main(int argc, const char * argv[]) {
 //                    BufferOffset<2> trackingNumberOffset(buf, 1);
 //                    BigEndian<BufferOffset<2>, int16_t> trackinNumberReader(trackingNumberOffset);
 //                    trackingNumber = trackinNumberReader.get();
-                    trackingNumber = layout.getSymbolLocate();
+                    //trackingNumber = layout.getSymbolLocate();
+                    totalValueTraded += price * volume;
                     // TODO use SoA of unconverted prices and volumes to parrallelize bigEndianRead()
-                } else {
+                } else if constexpr (readType == packed) {
                     auto message = reinterpret_cast<TradeMessage*>(buf);
+                    //auto message = new (buf) TradeMessage;
                     price = message->price.get();
                     volume = message->quantity.get();
-                    trackingNumber = message->symbolLocate.get();
+                    //trackingNumber = message->symbolLocate.get();
+                    totalValueTraded += price * volume;
                 }
-                totalValueTraded += price * volume;
+                else if constexpr (readType == threaded) {
+                    int produced = work.produced.load();
+                    int o = TradeMessageLayout::getOffset(TradeMessageLayout::Fields::price);
+                    for (int j : iota(0, 4)) prices[produced % calcBufferSize][j] = buf[o + j];
+                    o = TradeMessageLayout::getOffset(TradeMessageLayout::Fields::quantity);
+                    for (int j : iota(0, 4)) volumes[produced % calcBufferSize][j] = buf[o + j];
+                    work.produced.fetch_add(1);
+                }
+                // TODO get raw price and put into a circular buffer for a separate thread
                 
                 auto end = steady_clock::now();
                 auto duration = duration_cast<nanoseconds>(end - start);
@@ -270,7 +332,7 @@ int main(int argc, const char * argv[]) {
                 
                 int32_t expectedPrice = 0;
                 // big endian int to little endian
-                for (auto j : iota(0, 4)) {
+                /*for (auto j : iota(0, 4)) {
                     int h = buf[44 - 8 - 4 + j];
                     h &= 255;
                     expectedPrice <<= 8;
@@ -279,7 +341,7 @@ int main(int argc, const char * argv[]) {
                 
                 if (price != expectedPrice) {
                     cout << price << " != " << expectedPrice << " at message " << i << endl;
-                }
+                }*/
                 
                 // hex dump
                 for (auto j : std::ranges::views::iota(0u, n)) {
@@ -291,17 +353,20 @@ int main(int argc, const char * argv[]) {
                 
                 double todayPrice = price / 1e4;
                 todayPrice /= 20.0; // split in 2022
-                cout << symbol << ":" << trackingNumber << " "
-                     << std::dec << todayPrice << " " << volume << endl;
+                if (i % 100 == 0) {
+                    cout << symbol << " "
+                         << std::dec << todayPrice << " " << volume << endl;
                     // << message->price.get()
                     // << priceReader.get()
                     // << endl;
                     // << endl;
+                }
             }
             
         }
         (void)i;
     }
+    work.done.store(true);
     for (auto e : symbolTrades) {
         if (e.second < 2e3) continue;
         cout << e.first << ": " << e.second << endl;
@@ -314,9 +379,9 @@ int main(int argc, const char * argv[]) {
             u16.n = i;
             std::cout << std::dec << u16.b[0] << ":" << counts[i] << std::endl;
         }
-    cout << "Total: " << n << ", " << ticker << " Trades: " << tslas << ", Total Value Traded: " << totalValueTraded << endl;
+    cout << "Total: " << n << ", " << ticker << " Trades: " << tslas << ", Total Value Traded: " << totalValueTraded.load() << endl;
     std::sort(durations.begin(), durations.end());
-    long totalTime = 0;
+    int64_t totalTime = 0;
     for (auto duration : durations) totalTime += duration;
     cout << "Total time taken: " << totalTime << " us, "
          << "Median time taken: " << durations[durations.size() / 2] << " us"
