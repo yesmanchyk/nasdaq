@@ -11,6 +11,9 @@
 #include <asio/signal_set.hpp>
 #include <asio/write.hpp>
 
+#include "Messages.cpp"
+#include "Book.cpp"
+
 using asio::awaitable;
 using asio::ip::tcp;
 
@@ -49,6 +52,28 @@ void client(tcp::socket socket)
 		char b[2];
 	} u16{ 0 };
 	std::array<char, 1024> data;
+	std::string_view ticker = "GOOG    ";
+	Book book;
+	auto printBook = [&book]() {
+		std::cout << "bids:\n";
+		for (auto& entry : book.state(true)) {
+			std::cout << std::setw(8)
+				<< std::get<0>(entry)
+				<< " " << std::get<1>(entry)
+				<< " x " << std::get<2>(entry)
+				<< std::endl;
+		}
+		std::cout << "asks:\n";
+		for (auto& entry : book.state(false)) {
+			std::cout << std::setw(8)
+				<< std::get<0>(entry) 
+				<< " " << std::get<1>(entry)
+				<< " x " << std::get<2>(entry)
+				<< std::endl;
+		}
+	};
+
+	std::unordered_map<Book::OrderIdType, std::string> orderSymbols;
 	for (int i : iota(0, 1e9))
 	{
 		std::error_code error;
@@ -63,6 +88,79 @@ void client(tcp::socket socket)
 			throw std::system_error(error); // Some other error.
 		if (n < 1) break;
 		cout << i << ": " << n << "-byte message " << *data.begin() << endl;
+		auto buf = &data[0];
+		if (*buf == 'A' || *buf == 'F') {
+			// hex dump
+			for (auto j : std::ranges::views::iota(0u, n)) {
+				int h = buf[j];
+				h &= 255;
+				cout << std::hex << std::setfill('0') << std::setw(2) << h << " ";
+			}
+			cout << std::dec << endl;
+			//
+			auto* message = reinterpret_cast<AddOrder*>(buf);
+			auto orderId = message->orderId.get();
+			double todayPrice = message->price.get();
+			std::string_view symbol(message->symbol, 8);
+			orderSymbols[orderId] = symbol;
+			if (ticker == symbol) {
+				std::cout << "adding order " << orderId 
+					<< " of " << symbol << std::endl;
+
+				todayPrice = message->price.get() / 1e4;
+				todayPrice /= 20.0; // split in 2022
+
+				book.add(
+					message->side == 'B',
+					message->orderId.get(),
+					message->price.get(),
+					message->quantity.get()
+				);
+				printBook();
+			}
+
+			std::cout << std::string_view(message->symbol, 8)
+				<< " " << message->orderId.get()
+				<< " " << message->side
+				<< " " << message->quantity.get()
+				<< " x " << message->price.get()
+				<< " aka " << todayPrice
+				<< std::endl;
+
+		}
+		else if (*buf == 'C' || *buf == 'E') {
+			auto* message = reinterpret_cast<OrderExec*>(buf);
+			auto orderId = message->orderId.get();
+			std::cout << "orderId = " << orderId
+				<< ", volume = " << message->quantity.get()
+				<< std::endl;
+			if (orderSymbols[orderId] == ticker) {
+				std::cout << "executing order of " << ticker << std::endl;
+				book.exec(orderId, message->quantity.get());
+				printBook();
+			}
+		}
+		else if (*buf == 'X') {
+			auto* message = reinterpret_cast<CancelOrder*>(buf);
+			auto orderId = message->orderId.get();
+			std::cout << "orderId = " << orderId << std::endl;
+			if (orderSymbols[orderId] == ticker) {
+				std::cout << "canceling order of " << ticker << std::endl;
+				book.exec(orderId, message->quantity.get());
+				printBook();
+			}
+		}
+		else if (*buf == 'D') {
+			auto* message = reinterpret_cast<DelOrder*>(buf);
+			auto orderId = message->orderId.get();
+			std::cout << "orderId = " << orderId << std::endl;
+			if (orderSymbols[orderId] == ticker) {
+				std::cout << "deleting order of " << ticker << std::endl;
+				book.del(orderId);
+				printBook();
+			}
+			orderSymbols.erase(orderId);
+		}
 	}
 }
 
