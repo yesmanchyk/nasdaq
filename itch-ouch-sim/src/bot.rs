@@ -1,28 +1,30 @@
-//! Trading Bot with ITCH Market-Data Listener, OUCH Order Gateway,
+//! Trading Bot with PGM Multicast ITCH Listener, TCP OUCH Order Gateway,
 //! and Two Concurrent Strategy Threads per Bot.
 //!
 //! Architecture inside each Bot:
-//! 1. ITCH Listener Thread: Reads datagrams from the exchange and maintains
-//!    a shared `RwLock<ShadowBook>` (BBO, trade imbalance, last trade).
-//! 2. OUCH Reader Thread: Reads execution reports & acks over stream, updating
-//!    real-time inventory and cash PnL.
-//! 3. OUCH Writer Thread: Drains an `mpsc::Receiver<OuchInbound>` from the bot's
-//!    concurrent strategies so OUCH frames are never interleaved.
+//! 1. PGM ITCH Listener Thread: Joins IPv4 Multicast (`239.255.0.1:30001`),
+//!    tracks sequence continuity, issues RFC 3208 `PGM_NAK` on gaps, and updates
+//!    a shared `RwLock<ShadowBook>`.
+//! 2. TCP OUCH Reader Thread: Reads execution reports & acks over TCP (`TCP_NODELAY`),
+//!    updating real-time inventory and cash PnL.
+//! 3. TCP OUCH Writer Thread: Drains an `mpsc::Receiver<OuchInbound>` from the bot's
+//!    concurrent strategies so TCP OUCH frames are never interleaved.
 //! 4. Strategy Thread A & Strategy Thread B: Run concurrently, reading the shared
 //!    market state and firing `OuchInbound` commands down the MPSC channel.
 
+use crate::pgm::PgmSubscriber;
 use crate::protocol::{
     ItchMessage, OuchInbound, OuchOutbound, PRICE_SCALE, Side, fmt_price, try_read_frame,
     write_frame,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::net::{Ipv4Addr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-/// Shadow order book reconstructed from the exchange's ITCH feed
+/// Shadow order book reconstructed from the exchange's PGM ITCH feed
 #[derive(Default)]
 pub struct ShadowBook {
     /// order_ref -> (Side, price, shares)
@@ -34,6 +36,8 @@ pub struct ShadowBook {
     pub recent_buy_exec_vol: u64,
     pub recent_sell_exec_vol: u64,
     pub itch_packets: u64,
+    pub pgm_rdata_recovered: u64,
+    pub pgm_naks_sent: u64,
 }
 
 impl ShadowBook {
@@ -175,9 +179,11 @@ impl BotState {
         let pnl_dollars = mtm_pnl as f64 / (PRICE_SCALE as f64);
 
         format!(
-            "[{}] ITCH_Pkts: {:4} | Acks: {:4} | Cancels: {:4} | Fills: {:4} | Pos: {:+5} sh | MTM PnL: ${:+9.2}",
+            "[{}] PGM_ITCH: {:4} (RDATA:{}/NAK:{}) | Acks: {:4} | Cancels: {:4} | Fills: {:4} | Pos: {:+5} sh | MTM PnL: ${:+9.2}",
             self.name,
             book.itch_packets,
+            book.pgm_rdata_recovered,
+            book.pgm_naks_sent,
             self.acks_count.load(Ordering::Relaxed),
             self.cancels_count.load(Ordering::Relaxed),
             self.fills_count.load(Ordering::Relaxed),
@@ -199,6 +205,32 @@ pub enum StrategyKind {
     LiquidityTaker { lot_size: u32 },
 }
 
+pub fn default_strategies_for_bot(bot_id: u64) -> (&'static str, [StrategyKind; 2]) {
+    if bot_id == 1 {
+        (
+            "Bot-1 (MM + MeanRev)",
+            [
+                StrategyKind::MarketMaker {
+                    half_spread: 25,
+                    lot_size: 100,
+                },
+                StrategyKind::MeanReversion {
+                    fair_value: 100 * PRICE_SCALE,
+                    threshold: 30,
+                },
+            ],
+        )
+    } else {
+        (
+            "Bot-2 (Mom + Taker) ",
+            [
+                StrategyKind::MomentumSniper { lot_size: 40 },
+                StrategyKind::LiquidityTaker { lot_size: 60 },
+            ],
+        )
+    }
+}
+
 pub struct BotHandle {
     pub state: Arc<BotState>,
     threads: Vec<JoinHandle<()>>,
@@ -215,40 +247,47 @@ impl BotHandle {
 pub fn spawn_bot(
     name: &str,
     bot_id: u64,
-    ouch_stream: UnixStream,
-    itch_socket: UnixDatagram,
+    ouch_tcp_addr: &str,
+    pgm_mcast_group: Ipv4Addr,
+    pgm_mcast_port: u16,
+    pgm_nak_addr: &str,
     strategies: [StrategyKind; 2],
     running: Arc<AtomicBool>,
 ) -> std::io::Result<BotHandle> {
     let state = Arc::new(BotState::new(name, bot_id));
 
-    // Setup OUCH stream reader + writer
+    // Join PGM Multicast group before connecting TCP OUCH
+    let mut pgm_sub = PgmSubscriber::join(pgm_mcast_group, pgm_mcast_port, pgm_nak_addr)?;
+
+    // Connect TCP OUCH stream with TCP_NODELAY
+    let ouch_stream = TcpStream::connect(ouch_tcp_addr)?;
+    ouch_stream.set_nodelay(true)?;
     let mut ouch_reader = ouch_stream.try_clone()?;
     ouch_reader.set_nonblocking(true)?;
     let mut ouch_writer = ouch_stream;
 
-    itch_socket.set_nonblocking(true)?;
-
     let (ouch_tx, ouch_rx) = mpsc::channel::<OuchInbound>();
     let mut threads = Vec::new();
 
-    // 1. ITCH Market Data Receiver Thread
+    // 1. PGM Multicast ITCH Receiver Thread
     {
         let state = Arc::clone(&state);
         let running = Arc::clone(&running);
         threads.push(thread::spawn(move || {
-            let mut buf = [0u8; ItchMessage::WIRE_SIZE];
+            let mut batch = Vec::with_capacity(16);
             while running.load(Ordering::Relaxed) {
-                match itch_socket.recv(&mut buf) {
-                    Ok(n) if n == ItchMessage::WIRE_SIZE => {
-                        if let Some(msg) = ItchMessage::from_bytes(&buf)
-                            && let Ok(mut book) = state.book.write()
-                        {
-                            book.apply(msg);
+                batch.clear();
+                match pgm_sub.poll_itch(&mut batch) {
+                    Ok(true) => {
+                        if let Ok(mut book) = state.book.write() {
+                            for msg in batch.drain(..) {
+                                book.apply(msg);
+                            }
+                            book.pgm_rdata_recovered = pgm_sub.rdata_recv;
+                            book.pgm_naks_sent = pgm_sub.naks_sent;
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Ok(false) => {
                         thread::sleep(Duration::from_micros(50));
                     }
                     Err(_) => break,
@@ -257,7 +296,7 @@ pub fn spawn_bot(
         }));
     }
 
-    // 2. OUCH Execution Report Reader Thread
+    // 2. TCP OUCH Execution Report Reader Thread
     {
         let state = Arc::clone(&state);
         let running = Arc::clone(&running);
@@ -303,7 +342,7 @@ pub fn spawn_bot(
         }));
     }
 
-    // 3. OUCH Order Gateway Writer Thread (serializes orders from concurrent strategies)
+    // 3. TCP OUCH Order Gateway Writer Thread (serializes orders from concurrent strategies)
     {
         let running = Arc::clone(&running);
         threads.push(thread::spawn(move || {

@@ -1,17 +1,21 @@
-//! Single-Threaded Price-Time Priority Matching Engine with OUCH (Stream) and ITCH (Datagram).
+//! Single-Threaded Price-Time Priority Matching Engine with:
+//! - TCP OUCH 5.0 Order Entry & Execution Reports (`TcpListener` / `TcpStream`)
+//! - PGM (RFC 3208) Reliable Multicast ITCH 5.0 Market Data (`PgmPublisher`)
 //!
 //! Runs entirely on one thread with non-blocking sockets:
 //! - Zero locks or mutex contention inside the matching engine.
-//! - Deterministic sequence numbering for ITCH market data broadcasts.
+//! - Deterministic sequence numbering and PGM TX ring-buffer repair for ITCH broadcasts.
 
+use crate::pgm::PgmPublisher;
 use crate::protocol::{
     ItchMessage, OuchInbound, OuchOutbound, Side, fmt_price, try_read_frame, write_frame,
 };
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 struct RestingOrder {
@@ -41,31 +45,30 @@ pub struct ExchangeStats {
 }
 
 pub struct ExchangeServer {
-    ouch_listener: Option<UnixListener>,
-    itch_sockets: Vec<UnixDatagram>,
-    clients: Vec<Option<UnixStream>>,
+    ouch_listener: TcpListener,
+    pub pgm: PgmPublisher,
+    clients: Vec<Option<TcpStream>>,
     book: OrderBook,
     seq_num: u64,
     pub stats: ExchangeStats,
 }
 
 impl ExchangeServer {
-    pub fn new_connected(
-        ouch_streams: Vec<UnixStream>,
-        itch_sockets: Vec<UnixDatagram>,
+    pub fn bind(
+        ouch_bind_addr: &str,
+        pgm_mcast_group: Ipv4Addr,
+        pgm_mcast_port: u16,
+        pgm_nak_addr: &str,
     ) -> std::io::Result<Self> {
-        let mut clients = Vec::with_capacity(ouch_streams.len());
-        for s in ouch_streams {
-            s.set_nonblocking(true)?;
-            clients.push(Some(s));
-        }
-        for d in &itch_sockets {
-            d.set_nonblocking(true)?;
-        }
+        let ouch_listener = TcpListener::bind(ouch_bind_addr)?;
+        ouch_listener.set_nonblocking(true)?;
+
+        let pgm = PgmPublisher::bind(pgm_mcast_group, pgm_mcast_port, pgm_nak_addr, 0xCAFE_0001)?;
+
         Ok(Self {
-            ouch_listener: None,
-            itch_sockets,
-            clients,
+            ouch_listener,
+            pgm,
+            clients: Vec::new(),
             book: OrderBook::default(),
             seq_num: 0,
             stats: ExchangeStats {
@@ -78,21 +81,27 @@ impl ExchangeServer {
         })
     }
 
-    /// Single-threaded non-blocking poll loop
+    pub fn local_ouch_addr(&self) -> std::io::Result<SocketAddr> {
+        self.ouch_listener.local_addr()
+    }
+
+    /// Single-threaded non-blocking event loop polling TCP OUCH & PGM NAK sockets
     pub fn run(&mut self, running: Arc<AtomicBool>) {
+        let mut last_spm = Instant::now();
+        let spm_interval = Duration::from_millis(50);
+
         while running.load(Ordering::Relaxed) {
             let mut did_work = false;
 
-            // 1. Accept any new OUCH bot connections if listening on a path
-            if let Some(listener) = &self.ouch_listener
-                && let Ok((stream, _addr)) = listener.accept()
-            {
+            // 1. Accept any new TCP OUCH bot connections
+            if let Ok((stream, _peer)) = self.ouch_listener.accept() {
+                let _ = stream.set_nodelay(true);
                 let _ = stream.set_nonblocking(true);
                 self.clients.push(Some(stream));
                 did_work = true;
             }
 
-            // 2. Poll each connected OUCH client in round-robin order
+            // 2. Poll each connected TCP OUCH client in round-robin order
             for client_idx in 0..self.clients.len() {
                 let maybe_msg = if let Some(stream) = self.clients[client_idx].as_mut() {
                     match try_read_frame::<{ OuchInbound::WIRE_SIZE }>(stream) {
@@ -111,6 +120,17 @@ impl ExchangeServer {
                     did_work = true;
                     self.handle_ouch(client_idx, msg);
                 }
+            }
+
+            // 3. Poll PGM NAK socket for retransmission requests (RFC 3208 NCF + RDATA)
+            if self.pgm.poll_naks() {
+                did_work = true;
+            }
+
+            // 4. Emit periodic PGM Source Path Message (SPM) heartbeat
+            if last_spm.elapsed() >= spm_interval {
+                self.pgm.send_spm();
+                last_spm = Instant::now();
             }
 
             if !did_work {
@@ -297,7 +317,7 @@ impl ExchangeServer {
                 .by_cl_ord
                 .insert((client_idx, cl_ord_id), (incoming_ref, side, price));
 
-            // OUCH OrderAccepted back to submitting bot
+            // Private TCP OUCH OrderAccepted back to submitting bot
             self.send_ouch(
                 client_idx,
                 OuchOutbound::OrderAccepted {
@@ -309,9 +329,9 @@ impl ExchangeServer {
                 },
             );
 
-            // ITCH OrderAdded broadcast to all market participants
+            // Public PGM ITCH OrderAdded multicast broadcast
             self.seq_num += 1;
-            self.broadcast_itch(ItchMessage::OrderAdded {
+            self.pgm.publish_itch(ItchMessage::OrderAdded {
                 seq_num: self.seq_num,
                 order_ref: incoming_ref,
                 side,
@@ -339,7 +359,7 @@ impl ExchangeServer {
         self.stats.total_volume += fill_qty as u64;
         self.stats.last_trade_price = Some(fill_price);
 
-        // Private OUCH execution report to resting maker
+        // Private TCP OUCH execution report to resting maker
         self.send_ouch(
             resting_client,
             OuchOutbound::OrderExecuted {
@@ -351,7 +371,7 @@ impl ExchangeServer {
             },
         );
 
-        // Private OUCH execution report to aggressive taker
+        // Private TCP OUCH execution report to aggressive taker
         self.send_ouch(
             aggressor_client,
             OuchOutbound::OrderExecuted {
@@ -363,9 +383,9 @@ impl ExchangeServer {
             },
         );
 
-        // Public ITCH OrderExecuted broadcast
+        // Public PGM ITCH OrderExecuted multicast broadcast
         self.seq_num += 1;
-        self.broadcast_itch(ItchMessage::OrderExecuted {
+        self.pgm.publish_itch(ItchMessage::OrderExecuted {
             seq_num: self.seq_num,
             order_ref: resting_ref,
             side: resting_side,
@@ -419,7 +439,7 @@ impl ExchangeServer {
                 },
             );
             self.seq_num += 1;
-            self.broadcast_itch(ItchMessage::OrderDeleted {
+            self.pgm.publish_itch(ItchMessage::OrderDeleted {
                 seq_num: self.seq_num,
                 order_ref,
             });
@@ -432,13 +452,6 @@ impl ExchangeServer {
             if write_frame(stream, &bytes).is_err() {
                 self.clients[client_idx] = None;
             }
-        }
-    }
-
-    fn broadcast_itch(&self, msg: ItchMessage) {
-        let bytes = msg.to_bytes();
-        for sock in &self.itch_sockets {
-            let _ = sock.send(&bytes);
         }
     }
 
@@ -472,12 +485,15 @@ impl ExchangeServer {
             .unwrap_or_else(|| "N/A".to_string());
 
         format!(
-            "Orders: {} | Cancels: {} | Trades: {} | Vol: {} sh | LastPx: ${} | BBO: [Bid ${} x Ask ${}]",
+            "Orders: {} | Cancels: {} | Trades: {} | Vol: {} sh | LastPx: ${} | PGM[ODATA:{} RDATA:{} NAK:{}] | BBO: [Bid ${} x Ask ${}]",
             self.stats.total_orders,
             self.stats.total_cancels,
             self.stats.total_trades,
             self.stats.total_volume,
             last_px,
+            self.pgm.odata_sent,
+            self.pgm.rdata_sent,
+            self.pgm.naks_received,
             best_bid,
             best_ask
         )

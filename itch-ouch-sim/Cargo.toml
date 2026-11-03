@@ -1,6 +1,19 @@
 [package]
 name = "itch-ouch-sim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+default-run = "sim"
+
+[[bin]]
+name = "exchange"
+path = "src/bin/exchange.rs"
+
+[[bin]]
+name = "bot"
+path = "src/bin/bot.rs"
+
+[[bin]]
+name = "sim"
+path = "src/bin/sim.rs"
 
 [dependencies]
