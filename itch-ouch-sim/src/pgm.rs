@@ -13,7 +13,10 @@ use crate::protocol::ItchMessage;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 
 pub const DEFAULT_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 1);
 pub const DEFAULT_MCAST_PORT: u16 = 30001;
@@ -443,15 +446,27 @@ impl PgmSubscriber {
 }
 
 // ============================================================================
-// POSIX Multicast Socket Setup (SO_REUSEADDR + SO_REUSEPORT for Multi-Bot Host)
+// Multicast Socket Setup (SO_REUSEADDR + SO_REUSEPORT for Multi-Bot Host)
 // ============================================================================
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn setsockopt(socket: i32, level: i32, name: i32, value: *const u8, option_len: u32) -> i32;
     fn bind(socket: i32, address: *const u8, address_len: u32) -> i32;
 }
 
+#[cfg(windows)]
+#[link(name = "ws2_32")]
+unsafe extern "system" {
+    fn WSAStartup(wVersionRequested: u16, lpWSAData: *mut u8) -> i32;
+    fn socket(af: i32, type_: i32, protocol: i32) -> RawSocket;
+    fn setsockopt(s: RawSocket, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+    fn bind(s: RawSocket, name: *const u8, namelen: i32) -> i32;
+    fn closesocket(s: RawSocket) -> i32;
+}
+
+#[cfg(unix)]
 fn bind_shared_multicast_udp(mcast_group: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
     use std::os::fd::FromRawFd;
 
@@ -542,6 +557,75 @@ fn bind_shared_multicast_udp(mcast_group: Ipv4Addr, port: u16) -> io::Result<Udp
     Ok(sock)
 }
 
+#[cfg(windows)]
+fn bind_shared_multicast_udp(mcast_group: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
+    const AF_INET: i32 = 2;
+    const SOCK_DGRAM: i32 = 2;
+    const IPPROTO_UDP: i32 = 17;
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_REUSEADDR: i32 = 0x0004;
+    const INVALID_SOCKET: RawSocket = !0;
+
+    let mut wsa_data = [0u8; 512];
+    let wsa_rc = unsafe { WSAStartup(0x0202, wsa_data.as_mut_ptr()) };
+    if wsa_rc != 0 {
+        return Err(io::Error::from_raw_os_error(wsa_rc));
+    }
+
+    let raw_sock = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };
+    if raw_sock == INVALID_SOCKET {
+        return Err(io::Error::last_os_error());
+    }
+
+    let one: i32 = 1;
+    let opt_rc = unsafe {
+        setsockopt(
+            raw_sock,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            (&raw const one).cast(),
+            size_of::<i32>() as i32,
+        )
+    };
+    if opt_rc != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { closesocket(raw_sock) };
+        return Err(err);
+    }
+
+    #[repr(C)]
+    struct SockAddrIn {
+        sin_family: u16,
+        sin_port: u16,
+        sin_addr: u32,
+        sin_zero: [u8; 8],
+    }
+
+    let addr = SockAddrIn {
+        sin_family: AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: 0, // INADDR_ANY (0.0.0.0)
+        sin_zero: [0; 8],
+    };
+
+    let rc = unsafe {
+        bind(
+            raw_sock,
+            (&raw const addr).cast(),
+            size_of::<SockAddrIn>() as i32,
+        )
+    };
+    let sock = unsafe { UdpSocket::from_raw_socket(raw_sock) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    sock.join_multicast_v4(&mcast_group, &Ipv4Addr::LOCALHOST)?;
+    let _ = sock.as_raw_socket();
+    Ok(sock)
+}
+
+#[cfg(unix)]
 fn set_multicast_if_loopback(sock: &UdpSocket) -> io::Result<()> {
     const IPPROTO_IP: i32 = 0;
     #[cfg(target_os = "macos")]
@@ -560,6 +644,27 @@ fn set_multicast_if_loopback(sock: &UdpSocket) -> io::Result<()> {
         )
     };
     if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_multicast_if_loopback(sock: &UdpSocket) -> io::Result<()> {
+    const IPPROTO_IP: i32 = 0;
+    const IP_MULTICAST_IF: i32 = 9;
+
+    let loopback_be: u32 = u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets());
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket(),
+            IPPROTO_IP,
+            IP_MULTICAST_IF,
+            (&raw const loopback_be).cast(),
+            size_of::<u32>() as i32,
+        )
+    };
+    if rc != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

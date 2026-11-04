@@ -3,6 +3,7 @@ name = "itch-ouch-sim"
 version = "0.2.0"
 edition = "2024"
 default-run = "sim"
+autobins = false
 
 [[bin]]
 name = "exchange"
