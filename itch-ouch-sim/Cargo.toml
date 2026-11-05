@@ -22,3 +22,5 @@ name = "itch_client"
 path = "src/bin/itch_client.rs"
 
 [dependencies]
+eframe = "0.31"
+egui_plot = "0.31"
