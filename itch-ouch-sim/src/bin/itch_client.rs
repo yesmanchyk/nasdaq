@@ -1,13 +1,16 @@
-//! Standalone Real-Time ITCH 5.0 Market Data GUI Client (`itch_client`)
+//! Standalone Real-Time ITCH 5.0 Market Data & OUCH Order Entry GUI Client (`itch_client`)
 //!
 //! Uses `eframe` / `egui` + `egui_plot` to render:
-//! - Real-Time Streaming Price Chart (Last Trade, Mid Price, Best Bid / Best Ask envelope)
-//! - Level-2 Market Depth Order Book Ladder with volume bars & cumulative depth
-//! - Live Time & Sales (Trade Tape) and PGM Multicast Telemetry
-//! - Optional 1-click Built-in Simulation Traffic Generator (or passive listener for external `sim`/`exchange`)
+//! - Real-Time Streaming Price Chart (Last Trade, Mid Price, Best Bid / Best Ask envelope, Trade Dots)
+//! - Level-2 Market Depth Order Book Ladder with volume bars & interactive price pick
+//! - Interactive OUCH 5.0 Order Entry (Buy/Sell Limit Orders, Price & Quantity Steppers, Quick Presets)
+//! - Active Order Blotter with per-order Cancel and Cancel All buttons, Real-Time Position & MTM PnL
+//! - Live Time & Sales (Public Execution Tape) and PGM Multicast Reliability Telemetry
+//! - 1-Click Built-in Simulation Launcher (starts Exchange + 2 Bots and auto-connects OUCH)
 //!
 //! Usage:
 //!   cargo run --release --bin itch_client
+//!   cargo run --release --bin itch_client -- --ouch 127.0.0.1:40000
 //!   cargo run --release --bin itch_client -- --cli --duration-ms 2500
 
 use eframe::egui::{self, Color32, CornerRadius, FontId, RichText, Stroke, Vec2};
@@ -17,11 +20,14 @@ use itch_ouch_sim::exchange::ExchangeServer;
 use itch_ouch_sim::pgm::{
     DEFAULT_MCAST_GROUP, DEFAULT_MCAST_PORT, DEFAULT_NAK_ADDR, DEFAULT_OUCH_ADDR, PgmSubscriber,
 };
-use itch_ouch_sim::protocol::{ItchMessage, PRICE_SCALE, Side, fmt_price};
+use itch_ouch_sim::protocol::{
+    ItchMessage, OuchInbound, OuchOutbound, PRICE_SCALE, Side, fmt_price, try_read_frame,
+    write_frame,
+};
 use std::collections::VecDeque;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -137,7 +143,6 @@ impl SharedMarketState {
             .best_ask()
             .map(|(p, _)| p as f64 / PRICE_SCALE as f64);
 
-        // Append sample if trade occurred or enough time elapsed since last sample (or first sample)
         let should_sample = matches!(msg, ItchMessage::OrderExecuted { .. })
             || self
                 .samples
@@ -159,18 +164,211 @@ impl SharedMarketState {
     }
 }
 
+// ============================================================================
+// OUCH Client (TCP Order Entry & Execution Management)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderStatus {
+    PendingNew,
+    Open,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+}
+
+#[derive(Clone, Debug)]
+struct UserOrder {
+    cl_ord_id: u64,
+    order_ref: Option<u64>,
+    side: Side,
+    price_fp: u64,
+    initial_shares: u32,
+    remaining_shares: u32,
+    status: OrderStatus,
+    timestamp_s: f64,
+}
+
+struct OuchClient {
+    cmd_tx: Option<mpsc::Sender<OuchInbound>>,
+    event_rx: Option<mpsc::Receiver<OuchOutbound>>,
+    is_connected: Arc<AtomicBool>,
+    connected_addr: Arc<Mutex<String>>,
+    worker_stop: Option<Arc<AtomicBool>>,
+}
+
+impl OuchClient {
+    fn new() -> Self {
+        Self {
+            cmd_tx: None,
+            event_rx: None,
+            is_connected: Arc::new(AtomicBool::new(false)),
+            connected_addr: Arc::new(Mutex::new(String::new())),
+            worker_stop: None,
+        }
+    }
+
+    fn connect(&mut self, addr: &str) -> Result<(), String> {
+        if let Some(stop) = self.worker_stop.take() {
+            stop.store(false, Ordering::Relaxed);
+        }
+        self.is_connected.store(false, Ordering::Relaxed);
+
+        let stream = TcpStream::connect(addr).map_err(|e| format!("{e}"))?;
+        stream.set_nodelay(true).map_err(|e| format!("{e}"))?;
+        let mut reader = stream.try_clone().map_err(|e| format!("{e}"))?;
+        reader.set_nonblocking(true).map_err(|e| format!("{e}"))?;
+        let mut writer = stream;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<OuchInbound>();
+        let (event_tx, event_rx) = mpsc::channel::<OuchOutbound>();
+
+        let is_conn = Arc::clone(&self.is_connected);
+        is_conn.store(true, Ordering::Relaxed);
+        let stop_flag = Arc::new(AtomicBool::new(true));
+        let worker_stop = Arc::clone(&stop_flag);
+
+        *self.connected_addr.lock().unwrap() = addr.to_string();
+
+        // Writer Thread
+        let is_conn_w = Arc::clone(&is_conn);
+        let stop_w = Arc::clone(&stop_flag);
+        thread::Builder::new()
+            .name("ouch-gui-writer".into())
+            .spawn(move || {
+                while stop_w.load(Ordering::Relaxed) && is_conn_w.load(Ordering::Relaxed) {
+                    match cmd_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(cmd) => {
+                            let bytes = cmd.to_bytes();
+                            if write_frame(&mut writer, &bytes).is_err() {
+                                is_conn_w.store(false, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .ok();
+
+        // Reader Thread
+        let is_conn_r = Arc::clone(&is_conn);
+        let stop_r = Arc::clone(&stop_flag);
+        thread::Builder::new()
+            .name("ouch-gui-reader".into())
+            .spawn(move || {
+                while stop_r.load(Ordering::Relaxed) && is_conn_r.load(Ordering::Relaxed) {
+                    match try_read_frame::<{ OuchOutbound::WIRE_SIZE }>(&mut reader) {
+                        Ok(Some(raw)) => {
+                            if let Some(msg) = OuchOutbound::from_bytes(&raw) {
+                                if event_tx.send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(1)),
+                        Err(_) => {
+                            is_conn_r.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        self.cmd_tx = Some(cmd_tx);
+        self.event_rx = Some(event_rx);
+        self.worker_stop = Some(worker_stop);
+
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::Relaxed)
+    }
+
+    fn send(&self, cmd: OuchInbound) -> bool {
+        if let Some(ref tx) = self.cmd_tx {
+            tx.send(cmd).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for OuchClient {
+    fn drop(&mut self) {
+        if let Some(stop) = self.worker_stop.take() {
+            stop.store(false, Ordering::Relaxed);
+        }
+        self.is_connected.store(false, Ordering::Relaxed);
+    }
+}
+
+fn parse_price_fp(s: &str) -> Option<u64> {
+    let s = s.trim().trim_start_matches('$');
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    let dollars: u64 = parts[0].parse().ok()?;
+    let cents_str = if parts.len() == 2 { parts[1] } else { "" };
+    if cents_str.len() > 4 {
+        let truncated = &cents_str[..4];
+        let frac: u64 = truncated.parse().ok()?;
+        Some(dollars * PRICE_SCALE + frac)
+    } else {
+        let padded = format!("{:0<4}", cents_str);
+        let frac: u64 = padded.parse().ok()?;
+        Some(dollars * PRICE_SCALE + frac)
+    }
+}
+
+// ============================================================================
+// GUI Application State & Widgets
+// ============================================================================
+
+#[derive(PartialEq, Eq)]
+enum BottomTab {
+    OrdersAndPosition,
+    TimeAndSales,
+}
+
 struct ItchGuiApp {
     state: Arc<Mutex<SharedMarketState>>,
     mcast_group: Ipv4Addr,
     mcast_port: u16,
     nak_addr: String,
+    ouch_addr: String,
+    ouch_client: OuchClient,
+
+    // Order Entry Controls
+    order_side: Side,
+    order_price_str: String,
+    order_shares: u32,
+    next_cl_ord_id: u64,
+    order_status_feedback: Option<(String, bool)>, // (msg, is_error)
+
+    // User Orders & Position
+    user_orders: VecDeque<UserOrder>,
+    user_position: i64,
+    user_cash_fp: i64,
+    user_fills: u64,
+    user_cancels: u64,
+
+    // UI Configuration
     depth_levels: usize,
-    chart_window_secs: f64, // 0.0 = All
+    chart_window_secs: f64,
     show_last_price: bool,
     show_mid_price: bool,
     show_bid_ask: bool,
     show_trade_markers: bool,
     paused: bool,
+    bottom_tab: BottomTab,
     demo_sim_running: Option<Arc<AtomicBool>>,
     status_msg: String,
 }
@@ -181,22 +379,42 @@ impl ItchGuiApp {
         mcast_group: Ipv4Addr,
         mcast_port: u16,
         nak_addr: String,
+        ouch_addr: String,
     ) -> Self {
-        Self {
+        let mut app = Self {
             state,
             mcast_group,
             mcast_port,
             nak_addr,
-            depth_levels: 12,
+            ouch_addr: ouch_addr.clone(),
+            ouch_client: OuchClient::new(),
+            order_side: Side::Buy,
+            order_price_str: "100.0000".to_string(),
+            order_shares: 100,
+            next_cl_ord_id: 9_000_001,
+            order_status_feedback: None,
+            user_orders: VecDeque::new(),
+            user_position: 0,
+            user_cash_fp: 0,
+            user_fills: 0,
+            user_cancels: 0,
+            depth_levels: 10,
             chart_window_secs: 15.0,
             show_last_price: true,
             show_mid_price: true,
             show_bid_ask: true,
             show_trade_markers: true,
             paused: false,
+            bottom_tab: BottomTab::OrdersAndPosition,
             demo_sim_running: None,
             status_msg: "Listening on PGM Multicast".to_string(),
+        };
+
+        if app.ouch_client.connect(&ouch_addr).is_ok() {
+            app.status_msg = format!("Connected to OUCH {ouch_addr}");
         }
+
+        app
     }
 
     fn toggle_builtin_sim(&mut self) {
@@ -254,12 +472,203 @@ impl ItchGuiApp {
                 );
 
                 self.demo_sim_running = Some(sim_flag);
+                self.ouch_addr = ouch_addr.clone();
+                let _ = self.ouch_client.connect(&ouch_addr);
                 self.status_msg = format!("Built-in Exchange + 2 Bots running on {ouch_addr}");
             }
             Err(e) => {
-                self.status_msg = format!(
-                    "External Exchange already active or port busy ({e}) — listening passively"
-                );
+                self.status_msg = format!("Exchange port busy ({e}) — listening passively");
+            }
+        }
+    }
+
+    fn submit_order(&mut self) {
+        if !self.ouch_client.is_connected() {
+            self.order_status_feedback = Some((
+                "Cannot submit: OUCH disconnected. Connect to exchange first.".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let Some(price_fp) = parse_price_fp(&self.order_price_str) else {
+            self.order_status_feedback = Some((
+                format!("Invalid price '{}'. Example: 100.25", self.order_price_str),
+                true,
+            ));
+            return;
+        };
+
+        if price_fp == 0 {
+            self.order_status_feedback =
+                Some(("Order price must be greater than $0.0000".to_string(), true));
+            return;
+        }
+
+        if self.order_shares == 0 {
+            self.order_status_feedback =
+                Some(("Shares must be greater than 0".to_string(), true));
+            return;
+        }
+
+        let cl_ord_id = self.next_cl_ord_id;
+        self.next_cl_ord_id += 1;
+
+        let now_s = self
+            .state
+            .lock()
+            .unwrap()
+            .start_instant
+            .elapsed()
+            .as_secs_f64();
+
+        self.user_orders.push_front(UserOrder {
+            cl_ord_id,
+            order_ref: None,
+            side: self.order_side,
+            price_fp,
+            initial_shares: self.order_shares,
+            remaining_shares: self.order_shares,
+            status: OrderStatus::PendingNew,
+            timestamp_s: now_s,
+        });
+
+        let cmd = OuchInbound::EnterOrder {
+            cl_ord_id,
+            side: self.order_side,
+            shares: self.order_shares,
+            price: price_fp,
+        };
+
+        if self.ouch_client.send(cmd) {
+            let side_name = match self.order_side {
+                Side::Buy => "BUY",
+                Side::Sell => "SELL",
+            };
+            self.order_status_feedback = Some((
+                format!(
+                    "Submitted #{cl_ord_id}: {side_name} {} sh @ ${}",
+                    self.order_shares,
+                    fmt_price(price_fp)
+                ),
+                false,
+            ));
+        } else {
+            self.order_status_feedback =
+                Some(("Failed to send order down OUCH TCP socket".to_string(), true));
+        }
+    }
+
+    fn cancel_order(&mut self, cl_ord_id: u64) {
+        if !self.ouch_client.is_connected() {
+            self.order_status_feedback =
+                Some(("Cannot cancel: OUCH is disconnected".to_string(), true));
+            return;
+        }
+
+        let cmd = OuchInbound::CancelOrder { cl_ord_id };
+        if self.ouch_client.send(cmd) {
+            self.order_status_feedback =
+                Some((format!("Cancel request sent for #{cl_ord_id}"), false));
+        }
+    }
+
+    fn cancel_all_active_orders(&mut self) {
+        if !self.ouch_client.is_connected() {
+            return;
+        }
+        let mut count = 0;
+        for o in &self.user_orders {
+            if matches!(
+                o.status,
+                OrderStatus::PendingNew | OrderStatus::Open | OrderStatus::PartiallyFilled
+            ) {
+                let _ = self.ouch_client.send(OuchInbound::CancelOrder {
+                    cl_ord_id: o.cl_ord_id,
+                });
+                count += 1;
+            }
+        }
+        self.order_status_feedback =
+            Some((format!("Sent cancel requests for {count} open orders"), false));
+    }
+
+    fn process_ouch_events(&mut self) {
+        if let Some(ref rx) = self.ouch_client.event_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    OuchOutbound::OrderAccepted {
+                        cl_ord_id,
+                        order_ref,
+                        side: _,
+                        shares,
+                        price: _,
+                    } => {
+                        if let Some(ord) = self
+                            .user_orders
+                            .iter_mut()
+                            .find(|o| o.cl_ord_id == cl_ord_id)
+                        {
+                            ord.order_ref = Some(order_ref);
+                            ord.remaining_shares = shares;
+                            ord.status = OrderStatus::Open;
+                        }
+                    }
+                    OuchOutbound::OrderExecuted {
+                        cl_ord_id,
+                        order_ref,
+                        side,
+                        executed_shares,
+                        fill_price,
+                    } => {
+                        let mut is_mine = false;
+                        if let Some(ord) = self
+                            .user_orders
+                            .iter_mut()
+                            .find(|o| o.cl_ord_id == cl_ord_id)
+                        {
+                            is_mine = true;
+                            ord.order_ref = Some(order_ref);
+                            ord.remaining_shares =
+                                ord.remaining_shares.saturating_sub(executed_shares);
+                            if ord.remaining_shares == 0 {
+                                ord.status = OrderStatus::Filled;
+                            } else {
+                                ord.status = OrderStatus::PartiallyFilled;
+                            }
+                        }
+
+                        if is_mine {
+                            self.user_fills += 1;
+                            let qty = executed_shares as i64;
+                            let notional = qty * (fill_price as i64);
+                            match side {
+                                Side::Buy => {
+                                    self.user_position += qty;
+                                    self.user_cash_fp -= notional;
+                                }
+                                Side::Sell => {
+                                    self.user_position -= qty;
+                                    self.user_cash_fp += notional;
+                                }
+                            }
+                        }
+                    }
+                    OuchOutbound::OrderCanceled {
+                        cl_ord_id,
+                        order_ref: _,
+                        canceled_shares: _,
+                    } => {
+                        if let Some(ord) = self
+                            .user_orders
+                            .iter_mut()
+                            .find(|o| o.cl_ord_id == cl_ord_id)
+                        {
+                            ord.status = OrderStatus::Canceled;
+                            self.user_cancels += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -279,7 +688,10 @@ impl eframe::App for ItchGuiApp {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
-        // Snapshot current state under lock quickly
+        // 1. Drain OUCH Execution Reports & Acks
+        self.process_ouch_events();
+
+        // 2. Snapshot Market Feed under lock
         let (
             best_bid,
             best_ask,
@@ -371,7 +783,7 @@ impl eframe::App for ItchGuiApp {
                         self.paused = !self.paused;
                     }
 
-                    if ui.button("🗑 Reset").clicked() {
+                    if ui.button("🗑 Reset Market Data").clicked() {
                         self.state.lock().unwrap().reset();
                     }
 
@@ -383,7 +795,6 @@ impl eframe::App for ItchGuiApp {
 
                 // KPI Cards Row
                 ui.columns(6, |cols| {
-                    // 1. Last Trade Price
                     let last_color = match tick_dir {
                         1 => green,
                         -1 => red,
@@ -401,7 +812,6 @@ impl eframe::App for ItchGuiApp {
                     };
                     render_kpi_card(&mut cols[0], "LAST TRADE PRICE", &last_txt, last_color);
 
-                    // 2. Mid Price
                     render_kpi_card(
                         &mut cols[1],
                         "MID PRICE",
@@ -409,25 +819,21 @@ impl eframe::App for ItchGuiApp {
                         cyan,
                     );
 
-                    // 3. Best Bid
                     let bid_txt = best_bid
                         .map(|(p, q)| format!("${} ({} sh)", fmt_price(p), q))
                         .unwrap_or_else(|| "---".to_string());
                     render_kpi_card(&mut cols[2], "BEST BID", &bid_txt, green);
 
-                    // 4. Best Ask
                     let ask_txt = best_ask
                         .map(|(p, q)| format!("${} ({} sh)", fmt_price(p), q))
                         .unwrap_or_else(|| "---".to_string());
                     render_kpi_card(&mut cols[3], "BEST ASK", &ask_txt, red);
 
-                    // 5. Spread
                     let spread_txt = spread_fp
                         .map(|s| format!("${}", fmt_price(s)))
                         .unwrap_or_else(|| "NONE".to_string());
                     render_kpi_card(&mut cols[4], "SPREAD", &spread_txt, amber);
 
-                    // 6. Feed & Trade Volume
                     let stats_txt = format!(
                         "{} msgs | {} trd ({} sh)",
                         total_itch, total_trades, total_vol
@@ -437,21 +843,25 @@ impl eframe::App for ItchGuiApp {
             });
 
         // ====================================================================
-        // RIGHT PANEL: Level-2 Market Depth Ladder (Order Book)
+        // RIGHT PANEL: L2 Depth Ladder + Interactive Order Entry Controls
         // ====================================================================
+        let mut clicked_book_price: Option<u64> = None;
+
         egui::SidePanel::right("order_book_panel")
             .resizable(true)
-            .default_width(400.0)
-            .min_width(340.0)
+            .default_width(420.0)
+            .min_width(360.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+
+                // --- 1. L2 ORDER BOOK ---
                 ui.horizontal(|ui| {
                     ui.heading(RichText::new("ORDER BOOK (L2 DEPTH)").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         egui::ComboBox::from_id_salt("depth_sel")
                             .selected_text(format!("{} levels", self.depth_levels))
                             .show_ui(ui, |ui| {
-                                for d in [5, 8, 12, 16, 20] {
+                                for d in [5, 8, 10, 12, 16] {
                                     ui.selectable_value(
                                         &mut self.depth_levels,
                                         d,
@@ -469,7 +879,7 @@ impl eframe::App for ItchGuiApp {
                 } else {
                     0.5
                 };
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
@@ -494,7 +904,7 @@ impl eframe::App for ItchGuiApp {
                 });
 
                 let (bar_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), egui::Sense::hover());
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 7.0), egui::Sense::hover());
                 let painter = ui.painter();
                 painter.rect_filled(bar_rect, CornerRadius::same(3), Color32::from_rgb(90, 30, 35));
                 let mut bid_rect = bar_rect;
@@ -503,16 +913,15 @@ impl eframe::App for ItchGuiApp {
 
                 ui.separator();
 
-                // Column Headers
+                // Book Column Headers
                 ui.horizontal(|ui| {
-                    ui.add_sized([55.0, 18.0], egui::Label::new(RichText::new("LEVEL").small().color(muted)));
-                    ui.add_sized([95.0, 18.0], egui::Label::new(RichText::new("PRICE").small().color(muted)));
-                    ui.add_sized([80.0, 18.0], egui::Label::new(RichText::new("SHARES").small().color(muted)));
-                    ui.add_sized([85.0, 18.0], egui::Label::new(RichText::new("CUMULATIVE").small().color(muted)));
+                    ui.add_sized([55.0, 16.0], egui::Label::new(RichText::new("LEVEL").small().color(muted)));
+                    ui.add_sized([95.0, 16.0], egui::Label::new(RichText::new("PRICE").small().color(muted)));
+                    ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("SHARES").small().color(muted)));
+                    ui.add_sized([85.0, 16.0], egui::Label::new(RichText::new("CUMULATIVE").small().color(muted)));
                 });
                 ui.separator();
 
-                // Compute cumulative shares and max level size for depth shading
                 let mut ask_cum = Vec::with_capacity(top_asks.len());
                 let mut running_ask = 0u64;
                 for &(p, q) in &top_asks {
@@ -529,158 +938,616 @@ impl eframe::App for ItchGuiApp {
 
                 let max_cum = running_ask.max(running_bid).max(1) as f32;
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    // ASKS: displayed from highest price (top) down to Best Ask (bottom, just above spread)
-                    let missing_asks = self.depth_levels.saturating_sub(ask_cum.len());
-                    for _ in 0..missing_asks {
-                        render_empty_book_row(ui);
+                // Render Depth Table
+                let missing_asks = self.depth_levels.saturating_sub(ask_cum.len());
+                for _ in 0..missing_asks {
+                    render_empty_book_row(ui);
+                }
+                for (idx, &(price, shares, cum)) in ask_cum.iter().enumerate().rev() {
+                    if render_book_row(
+                        ui,
+                        &format!("ASK {}", idx + 1),
+                        price,
+                        shares,
+                        cum,
+                        cum as f32 / max_cum,
+                        red,
+                        Color32::from_rgba_unmultiplied(220, 50, 65, 45),
+                    ) {
+                        clicked_book_price = Some(price);
                     }
-                    for (idx, &(price, shares, cum)) in ask_cum.iter().enumerate().rev() {
-                        render_book_row(
-                            ui,
-                            &format!("ASK {}", idx + 1),
-                            price,
-                            shares,
-                            cum,
-                            cum as f32 / max_cum,
-                            red,
-                            Color32::from_rgba_unmultiplied(220, 50, 65, 45),
-                        );
-                    }
+                }
 
-                    // SPREAD BANNER
-                    ui.add_space(3.0);
-                    egui::Frame::NONE
-                        .fill(Color32::from_rgb(30, 35, 45))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(8, 5))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let sp_str = spread_fp
-                                    .map(|s| format!("Spread: ${}", fmt_price(s)))
-                                    .unwrap_or_else(|| "Spread: ---".to_string());
-                                ui.label(RichText::new(sp_str).strong().color(amber));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(format!("Mid: ${}", fmt_price(mid_fp)))
-                                                .strong()
-                                                .color(cyan),
-                                        );
-                                    },
+                // SPREAD BANNER
+                ui.add_space(2.0);
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(30, 35, 45))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let sp_str = spread_fp
+                                .map(|s| format!("Spread: ${}", fmt_price(s)))
+                                .unwrap_or_else(|| "Spread: ---".to_string());
+                            ui.label(RichText::new(sp_str).strong().color(amber));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("Mid: ${}", fmt_price(mid_fp)))
+                                        .strong()
+                                        .color(cyan),
                                 );
                             });
                         });
-                    ui.add_space(3.0);
+                    });
+                ui.add_space(2.0);
 
-                    // BIDS: displayed from Best Bid (top, just below spread) down to lower bids
-                    for (idx, &(price, shares, cum)) in bid_cum.iter().enumerate() {
-                        render_book_row(
-                            ui,
-                            &format!("BID {}", idx + 1),
-                            price,
-                            shares,
-                            cum,
-                            cum as f32 / max_cum,
-                            green,
-                            Color32::from_rgba_unmultiplied(0, 190, 100, 45),
-                        );
+                for (idx, &(price, shares, cum)) in bid_cum.iter().enumerate() {
+                    if render_book_row(
+                        ui,
+                        &format!("BID {}", idx + 1),
+                        price,
+                        shares,
+                        cum,
+                        cum as f32 / max_cum,
+                        green,
+                        Color32::from_rgba_unmultiplied(0, 190, 100, 45),
+                    ) {
+                        clicked_book_price = Some(price);
                     }
-                    let missing_bids = self.depth_levels.saturating_sub(bid_cum.len());
-                    for _ in 0..missing_bids {
-                        render_empty_book_row(ui);
-                    }
-                });
-            });
+                }
+                let missing_bids = self.depth_levels.saturating_sub(bid_cum.len());
+                for _ in 0..missing_bids {
+                    render_empty_book_row(ui);
+                }
 
-        // ====================================================================
-        // BOTTOM PANEL: Live Time & Sales (Trade Tape)
-        // ====================================================================
-        egui::TopBottomPanel::bottom("trade_tape_panel")
-            .resizable(true)
-            .default_height(185.0)
-            .min_height(110.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(RichText::new("TIME & SALES (LIVE TRADE EXECUTIONS)").strong());
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!(
-                            "PGM Reliability: RDATA Recovered: {} | NAKs Sent: {}",
-                            rdata, naks
-                        ))
-                        .small()
-                        .color(muted),
-                    );
-                });
+                ui.add_space(6.0);
                 ui.separator();
 
+                // --- 2. INTERACTIVE ORDER ENTRY (OUCH 5.0) ---
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("TIME (s)").small().color(muted)));
-                    ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("SEQ #").small().color(muted)));
-                    ui.add_sized([90.0, 16.0], egui::Label::new(RichText::new("ORDER REF").small().color(muted)));
-                    ui.add_sized([70.0, 16.0], egui::Label::new(RichText::new("SIDE").small().color(muted)));
-                    ui.add_sized([90.0, 16.0], egui::Label::new(RichText::new("SHARES").small().color(muted)));
-                    ui.add_sized([110.0, 16.0], egui::Label::new(RichText::new("MATCH PRICE").small().color(muted)));
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for tr in &recent_trades {
-                            let (side_txt, side_col) = match tr.side {
-                                Side::Buy => ("BUY", green),
-                                Side::Sell => ("SELL", red),
-                            };
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [80.0, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(format!("{:>7.3}s", tr.time_s)).monospace(),
-                                    ),
-                                );
-                                ui.add_sized(
-                                    [80.0, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(format!("#{}", tr.seq_num))
-                                            .monospace()
-                                            .color(muted),
-                                    ),
-                                );
-                                ui.add_sized(
-                                    [90.0, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(format!("#{}", tr.order_ref))
-                                            .monospace()
-                                            .color(muted),
-                                    ),
-                                );
-                                ui.add_sized(
-                                    [70.0, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(side_txt).monospace().strong().color(side_col),
-                                    ),
-                                );
-                                ui.add_sized(
-                                    [90.0, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(format!("{:>5} sh", tr.shares)).monospace(),
-                                    ),
-                                );
-                                ui.add_sized(
-                                    [110.0, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(format!("${}", fmt_price(tr.price_fp)))
-                                            .monospace()
-                                            .strong()
-                                            .color(side_col),
-                                    ),
-                                );
-                            });
+                    ui.heading(RichText::new("⚡ ORDER ENTRY (OUCH 5.0)").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.ouch_client.is_connected() {
+                            ui.label(RichText::new("🟢 OUCH Connected").small().color(green));
+                        } else {
+                            if ui.button(RichText::new("Connect OUCH").small()).clicked() {
+                                let _ = self.ouch_client.connect(&self.ouch_addr);
+                            }
+                            ui.label(RichText::new("🔴 Disconnected").small().color(red));
                         }
                     });
+                });
+
+                if !self.ouch_client.is_connected() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Target:").small().color(muted));
+                        ui.text_edit_singleline(&mut self.ouch_addr);
+                    });
+                }
+
+                ui.add_space(4.0);
+
+                // Buy / Sell Toggle Buttons
+                ui.columns(2, |cols| {
+                    let buy_active = self.order_side == Side::Buy;
+                    let buy_color = if buy_active {
+                        green
+                    } else {
+                        Color32::from_rgb(100, 110, 120)
+                    };
+                    if cols[0]
+                        .add_sized(
+                            [cols[0].available_width(), 28.0],
+                            egui::Button::new(
+                                RichText::new("BUY (BID)").strong().color(if buy_active {
+                                    Color32::BLACK
+                                } else {
+                                    Color32::WHITE
+                                }),
+                            )
+                            .fill(buy_color),
+                        )
+                        .clicked()
+                    {
+                        self.order_side = Side::Buy;
+                    }
+
+                    let sell_active = self.order_side == Side::Sell;
+                    let sell_color = if sell_active {
+                        red
+                    } else {
+                        Color32::from_rgb(100, 110, 120)
+                    };
+                    if cols[1]
+                        .add_sized(
+                            [cols[1].available_width(), 28.0],
+                            egui::Button::new(
+                                RichText::new("SELL (ASK)").strong().color(if sell_active {
+                                    Color32::BLACK
+                                } else {
+                                    Color32::WHITE
+                                }),
+                            )
+                            .fill(sell_color),
+                        )
+                        .clicked()
+                    {
+                        self.order_side = Side::Sell;
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Price Input with Steppers & Presets
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Price ($):").strong());
+                    ui.add_sized([90.0, 20.0], egui::TextEdit::singleline(&mut self.order_price_str));
+
+                    // Steppers
+                    if ui.button("-0.01").clicked() {
+                        if let Some(p) = parse_price_fp(&self.order_price_str) {
+                            self.order_price_str = fmt_price(p.saturating_sub(100));
+                        }
+                    }
+                    if ui.button("+0.01").clicked() {
+                        if let Some(p) = parse_price_fp(&self.order_price_str) {
+                            self.order_price_str = fmt_price(p.saturating_add(100));
+                        }
+                    }
+
+                    // Presets
+                    if let Some((bp, _)) = best_bid {
+                        if ui.button("Bid").clicked() {
+                            self.order_price_str = fmt_price(bp);
+                        }
+                    }
+                    if ui.button("Mid").clicked() {
+                        self.order_price_str = fmt_price(mid_fp);
+                    }
+                    if let Some((ap, _)) = best_ask {
+                        if ui.button("Ask").clicked() {
+                            self.order_price_str = fmt_price(ap);
+                        }
+                    }
+                });
+
+                // Shares Input with Steppers & Quick Chips
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Shares:   ").strong());
+                    let mut shares_str = format!("{}", self.order_shares);
+                    if ui
+                        .add_sized([90.0, 20.0], egui::TextEdit::singleline(&mut shares_str))
+                        .changed()
+                    {
+                        if let Ok(val) = shares_str.parse::<u32>() {
+                            self.order_shares = val;
+                        }
+                    }
+
+                    if ui.button("-10").clicked() {
+                        self.order_shares = self.order_shares.saturating_sub(10).max(1);
+                    }
+                    if ui.button("+10").clicked() {
+                        self.order_shares = self.order_shares.saturating_add(10);
+                    }
+
+                    for q in [50, 100, 200, 500] {
+                        if ui.button(format!("{q}")).clicked() {
+                            self.order_shares = q;
+                        }
+                    }
+                });
+
+                // Notional Value Display
+                let parsed_price = parse_price_fp(&self.order_price_str).unwrap_or(0);
+                let est_notional =
+                    (self.order_shares as f64) * (parsed_price as f64 / PRICE_SCALE as f64);
+                ui.label(
+                    RichText::new(format!(
+                        "Order Value: ${:.2}  (@ ${})",
+                        est_notional,
+                        fmt_price(parsed_price)
+                    ))
+                    .small()
+                    .color(muted),
+                );
+
+                ui.add_space(4.0);
+
+                // Big Submit Button
+                let (btn_txt, btn_color) = match self.order_side {
+                    Side::Buy => (
+                        format!(
+                            "🟢 SUBMIT BUY LIMIT ({} sh @ ${})",
+                            self.order_shares,
+                            fmt_price(parsed_price)
+                        ),
+                        Color32::from_rgb(0, 175, 95),
+                    ),
+                    Side::Sell => (
+                        format!(
+                            "🔴 SUBMIT SELL LIMIT ({} sh @ ${})",
+                            self.order_shares,
+                            fmt_price(parsed_price)
+                        ),
+                        Color32::from_rgb(215, 60, 75),
+                    ),
+                };
+
+                let submit_clicked = ui
+                    .add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(
+                            RichText::new(btn_txt)
+                                .strong()
+                                .font(FontId::proportional(14.0)),
+                        )
+                        .fill(btn_color),
+                    )
+                    .clicked();
+
+                if submit_clicked {
+                    self.submit_order();
+                }
+
+                // Feedback Banner
+                if let Some((ref msg, is_err)) = self.order_status_feedback {
+                    ui.add_space(2.0);
+                    let col = if is_err { red } else { green };
+                    ui.label(RichText::new(msg).small().color(col));
+                }
+            });
+
+        // If user clicked any row in the depth ladder, populate that price in order entry!
+        if let Some(p) = clicked_book_price {
+            self.order_price_str = fmt_price(p);
+        }
+
+        // ====================================================================
+        // BOTTOM PANEL: Order Blotter / Positions OR Time & Sales (Tabbed)
+        // ====================================================================
+        egui::TopBottomPanel::bottom("bottom_tab_panel")
+            .resizable(true)
+            .default_height(210.0)
+            .min_height(140.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let active_orders_count = self
+                        .user_orders
+                        .iter()
+                        .filter(|o| {
+                            matches!(
+                                o.status,
+                                OrderStatus::PendingNew
+                                    | OrderStatus::Open
+                                    | OrderStatus::PartiallyFilled
+                            )
+                        })
+                        .count();
+
+                    let orders_title = if active_orders_count > 0 {
+                        format!("⚡ MY ORDERS & POSITION ({active_orders_count} active)")
+                    } else {
+                        "⚡ MY ORDERS & POSITION".to_string()
+                    };
+
+                    if ui
+                        .selectable_label(
+                            self.bottom_tab == BottomTab::OrdersAndPosition,
+                            RichText::new(orders_title).strong(),
+                        )
+                        .clicked()
+                    {
+                        self.bottom_tab = BottomTab::OrdersAndPosition;
+                    }
+
+                    if ui
+                        .selectable_label(
+                            self.bottom_tab == BottomTab::TimeAndSales,
+                            RichText::new("📜 TIME & SALES (TRADE TAPE)").strong(),
+                        )
+                        .clicked()
+                    {
+                        self.bottom_tab = BottomTab::TimeAndSales;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "PGM Multicast: RDATA: {} | NAKs: {}",
+                                rdata, naks
+                            ))
+                            .small()
+                            .color(muted),
+                        );
+                    });
+                });
+                ui.separator();
+
+                match self.bottom_tab {
+                    BottomTab::OrdersAndPosition => {
+                        // Position & Account Summary Header Bar
+                        let pos = self.user_position;
+                        let cash_dollars = self.user_cash_fp as f64 / PRICE_SCALE as f64;
+                        let mtm_pnl_fp = self.user_cash_fp + pos * (mid_fp as i64);
+                        let mtm_pnl_dollars = mtm_pnl_fp as f64 / PRICE_SCALE as f64;
+
+                        let pos_col = if pos > 0 {
+                            green
+                        } else if pos < 0 {
+                            red
+                        } else {
+                            Color32::WHITE
+                        };
+                        let pnl_col = if mtm_pnl_dollars > 0.0 {
+                            green
+                        } else if mtm_pnl_dollars < 0.0 {
+                            red
+                        } else {
+                            Color32::WHITE
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Position:").small().color(muted));
+                            ui.label(
+                                RichText::new(format!("{:+5} sh", pos))
+                                    .strong()
+                                    .color(pos_col),
+                            );
+
+                            ui.separator();
+                            ui.label(RichText::new("Cash:").small().color(muted));
+                            ui.label(
+                                RichText::new(format!("${:.2}", cash_dollars))
+                                    .monospace()
+                                    .color(Color32::WHITE),
+                            );
+
+                            ui.separator();
+                            ui.label(RichText::new("MTM PnL:").small().color(muted));
+                            ui.label(
+                                RichText::new(format!("${:+.2}", mtm_pnl_dollars))
+                                    .strong()
+                                    .color(pnl_col),
+                            );
+
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Fills: {} | Cancels: {}",
+                                    self.user_fills, self.user_cancels
+                                ))
+                                .small()
+                                .color(muted),
+                            );
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button(RichText::new("❌ Cancel All Open Orders").small())
+                                        .clicked()
+                                    {
+                                        self.cancel_all_active_orders();
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+
+                        // Orders Table Headers
+                        ui.horizontal(|ui| {
+                            ui.add_sized([90.0, 16.0], egui::Label::new(RichText::new("CL_ORD_ID").small().color(muted)));
+                            ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("TIME").small().color(muted)));
+                            ui.add_sized([60.0, 16.0], egui::Label::new(RichText::new("SIDE").small().color(muted)));
+                            ui.add_sized([95.0, 16.0], egui::Label::new(RichText::new("PRICE").small().color(muted)));
+                            ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("SHARES").small().color(muted)));
+                            ui.add_sized([85.0, 16.0], egui::Label::new(RichText::new("REMAINING").small().color(muted)));
+                            ui.add_sized([100.0, 16.0], egui::Label::new(RichText::new("STATUS").small().color(muted)));
+                            ui.add_sized([90.0, 16.0], egui::Label::new(RichText::new("ACTION").small().color(muted)));
+                        });
+                        ui.separator();
+
+                        let mut order_to_cancel: Option<u64> = None;
+
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.user_orders.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "No orders submitted yet. Use the Order Entry panel on the right.",
+                                        )
+                                        .italics()
+                                        .color(muted),
+                                    );
+                                } else {
+                                    for ord in &self.user_orders {
+                                        let (side_txt, side_col) = match ord.side {
+                                            Side::Buy => ("BUY", green),
+                                            Side::Sell => ("SELL", red),
+                                        };
+                                        let (status_txt, status_col) = match ord.status {
+                                            OrderStatus::PendingNew => ("PENDING", amber),
+                                            OrderStatus::Open => ("OPEN", cyan),
+                                            OrderStatus::PartiallyFilled => ("PARTIAL", amber),
+                                            OrderStatus::Filled => ("FILLED", green),
+                                            OrderStatus::Canceled => ("CANCELED", muted),
+                                        };
+
+                                        ui.horizontal(|ui| {
+                                            ui.add_sized(
+                                                [90.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(format!("#{}", ord.cl_ord_id))
+                                                        .monospace(),
+                                                ),
+                                            );
+                                            ui.add_sized(
+                                                [80.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(format!("{:>6.2}s", ord.timestamp_s))
+                                                        .monospace()
+                                                        .color(muted),
+                                                ),
+                                            );
+                                            ui.add_sized(
+                                                [60.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(side_txt)
+                                                        .monospace()
+                                                        .strong()
+                                                        .color(side_col),
+                                                ),
+                                            );
+                                            ui.add_sized(
+                                                [95.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(format!("${}", fmt_price(ord.price_fp)))
+                                                        .monospace()
+                                                        .strong(),
+                                                ),
+                                            );
+                                            ui.add_sized(
+                                                [80.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(format!("{:>5} sh", ord.initial_shares))
+                                                        .monospace(),
+                                                ),
+                                            );
+                                            ui.add_sized(
+                                                [85.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(format!("{:>5} sh", ord.remaining_shares))
+                                                        .monospace()
+                                                        .color(if ord.remaining_shares > 0 {
+                                                            Color32::WHITE
+                                                        } else {
+                                                            muted
+                                                        }),
+                                                ),
+                                            );
+                                            ui.add_sized(
+                                                [100.0, 18.0],
+                                                egui::Label::new(
+                                                    RichText::new(status_txt)
+                                                        .monospace()
+                                                        .strong()
+                                                        .color(status_col),
+                                                ),
+                                            );
+
+                                            // Action Cancel Button
+                                            let can_cancel = matches!(
+                                                ord.status,
+                                                OrderStatus::PendingNew
+                                                    | OrderStatus::Open
+                                                    | OrderStatus::PartiallyFilled
+                                            );
+                                            if can_cancel {
+                                                if ui
+                                                    .add_sized(
+                                                        [80.0, 18.0],
+                                                        egui::Button::new(
+                                                            RichText::new("✖ Cancel")
+                                                                .small()
+                                                                .color(red),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    order_to_cancel = Some(ord.cl_ord_id);
+                                                }
+                                            } else {
+                                                ui.add_sized(
+                                                    [80.0, 18.0],
+                                                    egui::Label::new(
+                                                        RichText::new("---")
+                                                            .small()
+                                                            .color(Color32::DARK_GRAY),
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+
+                        if let Some(id) = order_to_cancel {
+                            self.cancel_order(id);
+                        }
+                    }
+
+                    BottomTab::TimeAndSales => {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("TIME (s)").small().color(muted)));
+                            ui.add_sized([80.0, 16.0], egui::Label::new(RichText::new("SEQ #").small().color(muted)));
+                            ui.add_sized([90.0, 16.0], egui::Label::new(RichText::new("ORDER REF").small().color(muted)));
+                            ui.add_sized([70.0, 16.0], egui::Label::new(RichText::new("SIDE").small().color(muted)));
+                            ui.add_sized([90.0, 16.0], egui::Label::new(RichText::new("SHARES").small().color(muted)));
+                            ui.add_sized([110.0, 16.0], egui::Label::new(RichText::new("MATCH PRICE").small().color(muted)));
+                        });
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for tr in &recent_trades {
+                                    let (side_txt, side_col) = match tr.side {
+                                        Side::Buy => ("BUY", green),
+                                        Side::Sell => ("SELL", red),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            [80.0, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(format!("{:>7.3}s", tr.time_s)).monospace(),
+                                            ),
+                                        );
+                                        ui.add_sized(
+                                            [80.0, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(format!("#{}", tr.seq_num))
+                                                    .monospace()
+                                                    .color(muted),
+                                            ),
+                                        );
+                                        ui.add_sized(
+                                            [90.0, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(format!("#{}", tr.order_ref))
+                                                    .monospace()
+                                                    .color(muted),
+                                                ),
+                                        );
+                                        ui.add_sized(
+                                            [70.0, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(side_txt).monospace().strong().color(side_col),
+                                            ),
+                                        );
+                                        ui.add_sized(
+                                            [90.0, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(format!("{:>5} sh", tr.shares)).monospace(),
+                                            ),
+                                        );
+                                        ui.add_sized(
+                                            [110.0, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(format!("${}", fmt_price(tr.price_fp)))
+                                                    .monospace()
+                                                    .strong()
+                                                    .color(side_col),
+                                            ),
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                }
             });
 
         // ====================================================================
@@ -846,12 +1713,19 @@ fn render_book_row(
     depth_fraction: f32,
     text_color: Color32,
     bar_color: Color32,
-) {
+) -> bool {
     let row_height = 20.0;
     let desired = Vec2::new(ui.available_width(), row_height);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
 
-    // Draw right-aligned depth bar proportional to cumulative depth
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(2),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+        );
+    }
+
     let bar_w = rect.width() * depth_fraction.clamp(0.02, 1.0);
     let bar_rect = egui::Rect::from_min_max(
         egui::pos2(rect.max.x - bar_w, rect.min.y + 1.0),
@@ -900,6 +1774,8 @@ fn render_book_row(
                 .color(Color32::from_rgb(165, 175, 190)),
         ),
     );
+
+    response.clicked()
 }
 
 fn render_empty_book_row(ui: &mut egui::Ui) {
@@ -918,7 +1794,7 @@ fn render_empty_book_row(ui: &mut egui::Ui) {
 }
 
 // ============================================================================
-// Optional CLI Fallback (`--cli`) + Main Entrypoint
+// CLI Fallback (`--cli`) + Main Entrypoint
 // ============================================================================
 
 fn run_cli_mode(
@@ -988,16 +1864,21 @@ fn main() -> std::io::Result<()> {
     let mut mcast_group = DEFAULT_MCAST_GROUP;
     let mut mcast_port = DEFAULT_MCAST_PORT;
     let mut nak_addr = DEFAULT_NAK_ADDR.to_string();
-    let mut depth: usize = 5;
+    let mut ouch_addr = DEFAULT_OUCH_ADDR.to_string();
+    let mut depth: usize = 10;
     let mut refresh_ms: u64 = 250;
     let mut duration_ms: Option<u64> = None;
     let mut cli_mode = false;
-    let _ = DEFAULT_OUCH_ADDR;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cli" => cli_mode = true,
+            "--ouch" => {
+                if let Some(v) = args.next() {
+                    ouch_addr = v;
+                }
+            }
             "--mcast-group" => {
                 if let Some(v) = args.next()
                     && let Ok(ip) = v.parse::<Ipv4Addr>()
@@ -1087,14 +1968,14 @@ fn main() -> std::io::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("NASDAQ ITCH 5.0 — Order Book & Real-Time Price Chart")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([960.0, 600.0]),
+            .with_title("NASDAQ ITCH 5.0 / OUCH 5.0 — Market Depth, Price Chart & Order Blotter")
+            .with_inner_size([1360.0, 840.0])
+            .with_min_inner_size([980.0, 620.0]),
         ..Default::default()
     };
 
     let _ = eframe::run_native(
-        "NASDAQ ITCH 5.0 Market Monitor",
+        "NASDAQ ITCH / OUCH Market Monitor",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -1103,9 +1984,65 @@ fn main() -> std::io::Result<()> {
                 mcast_group,
                 mcast_port,
                 nak_addr,
+                ouch_addr,
             )))
         }),
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_price_fp() {
+        assert_eq!(parse_price_fp("100"), Some(1_000_000));
+        assert_eq!(parse_price_fp("100.25"), Some(1_002_500));
+        assert_eq!(parse_price_fp("$100.2500"), Some(1_002_500));
+        assert_eq!(parse_price_fp("98.5"), Some(985_000));
+        assert_eq!(parse_price_fp("98.1234"), Some(981_234));
+        assert_eq!(parse_price_fp("98.12349"), Some(981_234));
+        assert_eq!(parse_price_fp(""), None);
+        assert_eq!(parse_price_fp("abc"), None);
+    }
+
+    #[test]
+    fn test_order_roundtrip() {
+        let enter = OuchInbound::EnterOrder {
+            cl_ord_id: 9_000_001,
+            side: Side::Buy,
+            shares: 100,
+            price: 1_002_500,
+        };
+        let bytes = enter.to_bytes();
+        let decoded = OuchInbound::from_bytes(&bytes).expect("valid frame");
+        match decoded {
+            OuchInbound::EnterOrder {
+                cl_ord_id,
+                side,
+                shares,
+                price,
+            } => {
+                assert_eq!(cl_ord_id, 9_000_001);
+                assert_eq!(side, Side::Buy);
+                assert_eq!(shares, 100);
+                assert_eq!(price, 1_002_500);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let cancel = OuchInbound::CancelOrder {
+            cl_ord_id: 9_000_001,
+        };
+        let c_bytes = cancel.to_bytes();
+        let c_decoded = OuchInbound::from_bytes(&c_bytes).expect("valid frame");
+        match c_decoded {
+            OuchInbound::CancelOrder { cl_ord_id } => {
+                assert_eq!(cl_ord_id, 9_000_001);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
