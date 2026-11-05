@@ -1,6 +1,6 @@
-# `itch-ouch-sim` — Single-Threaded PGM ITCH / TCP OUCH Exchange & Multi-Strategy Trading Bots
+# `itch-ouch-sim` — Single-Threaded PGM ITCH / TCP OUCH Exchange, Multi-Strategy Bots & Real-Time GUI Client
 
-A zero-dependency, low-latency Rust implementation of a **single-threaded price-time priority matching engine** and **two multi-strategy trading bots** communicating over **NASDAQ OUCH 5.0 (TCP)** and **PGM-encapsulated NASDAQ ITCH 5.0 (IPv4 Reliable Multicast)**.
+A high-performance, cross-platform (Windows & Linux/macOS) Rust implementation of a **single-threaded price-time priority matching engine**, **two multi-strategy trading bots**, and an **interactive real-time desktop GUI trading terminal** communicating over **NASDAQ OUCH 5.0 (TCP)** and **PGM-encapsulated NASDAQ ITCH 5.0 (IPv4 Reliable Multicast)**.
 
 ---
 
@@ -28,6 +28,14 @@ flowchart LR
         B2PGM --> B2GW
     end
 
+    subgraph GUI["Terminal / Trader (bin/itch_client)"]
+        GUI_CHART["Price Chart + L2 Depth Ladder"]
+        GUI_OE["OUCH Order Entry + Blotter (Cancel/Cancel All)"]
+        GUI_PGM["PgmSubscriber (239.255.0.1:30001)"]
+        GUI_PGM --> GUI_CHART
+        GUI_OE --> GUI_CHART
+    end
+
     subgraph Exchange["Single-Threaded Exchange (bin/exchange)"]
         EL["Non-Blocking Event Loop"]
         OB["Limit Order Book (BTreeMap + VecDeque)"]
@@ -37,10 +45,13 @@ flowchart LR
 
     B1GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
     B2GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
+    GUI_OE <-- "TCP OUCH (127.0.0.1:40000)" --> EL
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B1PGM
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B2PGM
+    PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> GUI_PGM
     B1PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
     B2PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
+    GUI_PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
 ```
 
 ---
@@ -50,12 +61,39 @@ flowchart LR
 | Module / Binary | Description |
 | :--- | :--- |
 | `src/protocol.rs` | Fixed-size, Big-Endian (network byte order) binary wire frames for **OUCH Inbound** (`EnterOrder`, `CancelOrder` — 22 B), **OUCH Outbound** (`OrderAccepted`, `OrderExecuted`, `OrderCanceled` — 30 B), and **ITCH 5.0** (`OrderAdded`, `OrderExecuted`, `OrderDeleted` — 30 B). Prices use 4-decimal fixed-point representation (`PRICE_SCALE = 10_000`). |
-| `src/pgm.rs` | **RFC 3208 UDP-Encapsulated Pragmatic General Multicast (PGM)** layer (52-byte frames): supports `PGM_SPM` (`0x00`) heartbeats, `PGM_ODATA` (`0x04`) original multicast data, `PGM_RDATA` (`0x05`) repair retransmissions from a 65,536-slot circular transmit window, `PGM_NAK` (`0x08`) gap requests, and `PGM_NCF` (`0x09`) NAK confirmations. Uses `SO_REUSEADDR` + `SO_REUSEPORT` + `IP_MULTICAST_IF` so multiple bot processes on the same host share the multicast feed. |
+| `src/pgm.rs` | **RFC 3208 UDP-Encapsulated Pragmatic General Multicast (PGM)** layer (52-byte frames): supports `PGM_SPM` (`0x00`) heartbeats, `PGM_ODATA` (`0x04`) original multicast data, `PGM_RDATA` (`0x05`) repair retransmissions from a 65,536-slot circular transmit window, `PGM_NAK` (`0x08`) gap requests, and `PGM_NCF` (`0x09`) NAK confirmations. Fully cross-platform: uses `SO_REUSEADDR` + `SO_REUSEPORT` on POSIX/macOS and Winsock2 (`ws2_32`) on Windows with loopback multicast interface setup. |
 | `src/exchange.rs` | Single-threaded non-blocking limit order book and matching engine (`ExchangeServer`). Zero locks or mutex contention on the matching path. |
 | `src/bot.rs` | Multi-threaded bot client (`spawn_bot`) with a dedicated PGM ITCH receiver thread (maintaining a local `ShadowBook`), a TCP OUCH reader thread (tracking real-time inventory and mark-to-market PnL), a serialized TCP OUCH writer thread (`mpsc::Receiver<OuchInbound>`), and **2 concurrent strategy threads**. |
 | `src/bin/exchange.rs` | Standalone Exchange Server executable (`exchange`). |
 | `src/bin/bot.rs` | Standalone Trading Bot executable (`bot`). |
 | `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange and both bots. |
+| `src/bin/itch_client.rs` | Real-time **desktop GUI trading terminal** built with `eframe` / `egui` and `egui_plot`, featuring live price charts, L2 market depth ladder, interactive OUCH order submission/cancellation, order blotter with MTM PnL tracking, public Time & Sales tape, and a CLI fallback mode (`--cli`). |
+
+---
+
+## Real-Time GUI Client (`itch_client`)
+
+The `itch_client` application provides an institutional-grade monitoring and trading interface:
+
+1. **Real-Time Price Chart (`egui_plot`)**:
+   - Streaming **Last Trade Price**, **Mid Price**, and **Best Bid / Best Ask** envelope.
+   - Color-coded Buy (green) and Sell (red) execution dots.
+   - Configurable time horizons (`5s`, `15s`, `30s`, `60s`, `All`) with interactive pan/zoom.
+2. **Level-2 Market Depth Ladder**:
+   - Depth ladder showing price levels, shares, and cumulative volume with proportional depth bars.
+   - Real-time Bid/Ask order book imbalance meter.
+   - **Click-to-Pick**: Clicking any level in the depth ladder automatically copies that price into the Order Entry ticket.
+3. **Interactive OUCH Order Entry**:
+   - Toggle **BUY** / **SELL** with quantity chips (`50`, `100`, `200`, `500`) and steppers.
+   - Price adjustment with `[-0.01]` / `[+0.01]` and quick anchors (`Bid`, `Mid`, `Ask`).
+   - Live order notional calculation and instant limit order submission via TCP OUCH.
+4. **Order Blotter & Position Tracker**:
+   - Live inventory position, cash balance, and continuous Mark-to-Market (MTM) PnL.
+   - Active orders table with per-order **Cancel** buttons and a **Cancel All Open Orders** button.
+5. **Time & Sales (Trade Tape)**:
+   - Full public market execution stream showing timestamp, sequence number, order reference, side, shares, and execution price.
+6. **1-Click Built-in Simulator**:
+   - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 2 trading bots and auto-connect OUCH with zero configuration.
 
 ---
 
@@ -78,14 +116,21 @@ flowchart LR
 cargo build --release
 ```
 
-### 2. Run the Combined Simulation (`sim`)
+### 2. Launch the Desktop GUI Client
+
+```bash
+cargo run --release --bin itch_client
+```
+> **Tip**: Click **`▶ Start Built-in Sim`** in the top bar to immediately spin up the Exchange and trading bots, or run standalone processes as shown below.
+
+### 3. Run the Combined Headless Simulation (`sim`)
 
 ```bash
 # Run for 2000ms (default)
 cargo run --release --bin sim -- 2000
 ```
 
-### 3. Run Standalone Processes in Separate Terminals
+### 4. Run Standalone Processes in Separate Terminals
 
 **Terminal 1 — Start the Single-Threaded Exchange Server:**
 ```bash
@@ -96,12 +141,21 @@ cargo run --release --bin exchange -- \
   --nak 127.0.0.1:30002
 ```
 
-**Terminal 2 — Start Bot 1 (Market Maker + Mean Reversion):**
+**Terminal 2 — Start the Real-Time GUI (or CLI terminal mode):**
+```bash
+# Desktop GUI:
+cargo run --release --bin itch_client
+
+# Or Headless Terminal Mode:
+cargo run --release --bin itch_client -- --cli --depth 10
+```
+
+**Terminal 3 — Start Bot 1 (Market Maker + Mean Reversion):**
 ```bash
 cargo run --release --bin bot -- --id 1 --duration-ms 5000
 ```
 
-**Terminal 3 — Start Bot 2 (Momentum Sniper + Liquidity Taker):**
+**Terminal 4 — Start Bot 2 (Momentum Sniper + Liquidity Taker):**
 ```bash
 cargo run --release --bin bot -- --id 2 --duration-ms 5000
 ```
