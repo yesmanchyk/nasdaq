@@ -17,4 +17,8 @@ path = "src/bin/bot.rs"
 name = "sim"
 path = "src/bin/sim.rs"
 
+[[bin]]
+name = "itch_client"
+path = "src/bin/itch_client.rs"
+
 [dependencies]

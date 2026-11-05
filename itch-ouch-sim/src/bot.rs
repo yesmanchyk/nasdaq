@@ -123,6 +123,29 @@ impl ShadowBook {
         self.asks.iter().next().map(|(&p, &q)| (p, q))
     }
 
+    pub fn spread(&self) -> Option<u64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some((b, _)), Some((a, _))) if a >= b => Some(a - b),
+            _ => None,
+        }
+    }
+
+    pub fn top_bids(&self, depth: usize) -> Vec<(u64, u32)> {
+        self.bids.iter().rev().take(depth).map(|(&p, &q)| (p, q)).collect()
+    }
+
+    pub fn top_asks(&self, depth: usize) -> Vec<(u64, u32)> {
+        self.asks.iter().take(depth).map(|(&p, &q)| (p, q)).collect()
+    }
+
+    pub fn total_bid_shares(&self) -> u64 {
+        self.bids.values().map(|&q| q as u64).sum()
+    }
+
+    pub fn total_ask_shares(&self) -> u64 {
+        self.asks.values().map(|&q| q as u64).sum()
+    }
+
     pub fn mid_price(&self) -> u64 {
         match (self.best_bid(), self.best_ask()) {
             (Some((b, _)), Some((a, _))) => (b + a) / 2,
