@@ -15,7 +15,7 @@
 
 use eframe::egui::{self, Color32, CornerRadius, FontId, RichText, Stroke, Vec2};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
-use itch_ouch_sim::bot::{ShadowBook, default_strategies_for_bot, spawn_bot};
+use itch_ouch_sim::bot::{BotState, ShadowBook, default_strategies_for_bot, spawn_bot};
 use itch_ouch_sim::exchange::ExchangeServer;
 use itch_ouch_sim::pgm::{
     DEFAULT_MCAST_GROUP, DEFAULT_MCAST_PORT, DEFAULT_NAK_ADDR, DEFAULT_OUCH_ADDR, PgmSubscriber,
@@ -336,7 +336,21 @@ fn parse_price_fp(s: &str) -> Option<u64> {
 enum BottomTab {
     OrdersAndPosition,
     TimeAndSales,
+    BotPnl,
 }
+
+/// A built-in simulation bot tracked by the GUI for live PnL display
+struct SimBot {
+    state: Arc<BotState>,
+    /// (elapsed seconds since sim start, MTM PnL in dollars)
+    pnl_history: Vec<[f64; 2]>,
+}
+
+const BOT_COLORS: [Color32; 3] = [
+    Color32::from_rgb(80, 190, 250),
+    Color32::from_rgb(245, 190, 60),
+    Color32::from_rgb(200, 120, 255),
+];
 
 struct ItchGuiApp {
     state: Arc<Mutex<SharedMarketState>>,
@@ -371,6 +385,11 @@ struct ItchGuiApp {
     bottom_tab: BottomTab,
     demo_sim_running: Option<Arc<AtomicBool>>,
     status_msg: String,
+
+    // Built-in simulation bots (kept after stop so final PnL stays visible)
+    sim_bots: Vec<SimBot>,
+    sim_started_at: Option<Instant>,
+    sim_stopped_after_s: Option<f64>,
 }
 
 impl ItchGuiApp {
@@ -408,6 +427,9 @@ impl ItchGuiApp {
             bottom_tab: BottomTab::OrdersAndPosition,
             demo_sim_running: None,
             status_msg: "Listening on PGM Multicast".to_string(),
+            sim_bots: Vec::new(),
+            sim_started_at: None,
+            sim_stopped_after_s: None,
         };
 
         if app.ouch_client.connect(&ouch_addr).is_ok() {
@@ -420,7 +442,11 @@ impl ItchGuiApp {
     fn toggle_builtin_sim(&mut self) {
         if let Some(flag) = self.demo_sim_running.take() {
             flag.store(false, Ordering::Relaxed);
-            self.status_msg = "Stopped built-in simulation".to_string();
+            // Take one last PnL sample so the final result is on the chart
+            self.sample_bot_pnl(true);
+            self.sim_stopped_after_s = self.sim_started_at.map(|t| t.elapsed().as_secs_f64());
+            self.status_msg = "Stopped built-in simulation — final bot PnL in 🤖 BOT PnL tab".to_string();
+            self.bottom_tab = BottomTab::BotPnl;
             return;
         }
 
@@ -447,51 +473,210 @@ impl ItchGuiApp {
                     })
                     .ok();
 
-                let (name1, strat1) = default_strategies_for_bot(1);
-                let _ = spawn_bot(
-                    name1,
-                    1,
-                    &ouch_addr,
-                    mcast_group,
-                    mcast_port,
-                    &nak_addr,
-                    strat1,
-                    Arc::clone(&running),
-                );
-
-                let (name2, strat2) = default_strategies_for_bot(2);
-                let _ = spawn_bot(
-                    name2,
-                    2,
-                    &ouch_addr,
-                    mcast_group,
-                    mcast_port,
-                    &nak_addr,
-                    strat2,
-                    Arc::clone(&running),
-                );
-
-                let (name3, strat3) = default_strategies_for_bot(3);
-                let _ = spawn_bot(
-                    name3,
-                    3,
-                    &ouch_addr,
-                    mcast_group,
-                    mcast_port,
-                    &nak_addr,
-                    strat3,
-                    Arc::clone(&running),
-                );
+                self.sim_bots.clear();
+                for bot_id in 1..=3u64 {
+                    let (name, strats) = default_strategies_for_bot(bot_id);
+                    match spawn_bot(
+                        name,
+                        bot_id,
+                        &ouch_addr,
+                        mcast_group,
+                        mcast_port,
+                        &nak_addr,
+                        strats,
+                        Arc::clone(&running),
+                    ) {
+                        // Threads are detached; we only keep the shared state for PnL display
+                        Ok(handle) => self.sim_bots.push(SimBot {
+                            state: Arc::clone(&handle.state),
+                            pnl_history: Vec::new(),
+                        }),
+                        Err(e) => {
+                            self.status_msg = format!("Failed to start bot {bot_id}: {e}");
+                        }
+                    }
+                }
+                self.sim_started_at = Some(Instant::now());
+                self.sim_stopped_after_s = None;
 
                 self.demo_sim_running = Some(sim_flag);
                 self.ouch_addr = ouch_addr.clone();
                 let _ = self.ouch_client.connect(&ouch_addr);
-                self.status_msg = format!("Built-in Exchange + 3 Bots running on {ouch_addr}");
+                self.status_msg = format!(
+                    "Built-in Exchange + {} Bots running on {ouch_addr}",
+                    self.sim_bots.len()
+                );
             }
             Err(e) => {
                 self.status_msg = format!("Exchange port busy ({e}) — listening passively");
             }
         }
+    }
+
+    /// Append a PnL sample for each built-in bot (throttled to ~10 Hz unless forced).
+    fn sample_bot_pnl(&mut self, force: bool) {
+        let Some(start) = self.sim_started_at else {
+            return;
+        };
+        if self.demo_sim_running.is_none() && !force {
+            return;
+        }
+        let t = start.elapsed().as_secs_f64();
+        for bot in &mut self.sim_bots {
+            let due = bot
+                .pnl_history
+                .last()
+                .is_none_or(|last| t - last[0] >= 0.1);
+            if force || due {
+                let pnl = bot.state.pnl_snapshot().mtm_pnl_fp as f64 / PRICE_SCALE as f64;
+                bot.pnl_history.push([t, pnl]);
+            }
+        }
+    }
+
+    fn render_bot_pnl_tab(&self, ui: &mut egui::Ui, green: Color32, red: Color32, muted: Color32) {
+        if self.sim_bots.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(
+                    "No built-in bots yet. Click ▶ Start Built-in Sim to run the Exchange + 3 Bots \
+                     and track how much money each bot makes.",
+                )
+                .color(muted),
+            );
+            ui.label(
+                RichText::new(
+                    "(Bots launched as separate `bot` processes run in their own address space \
+                     and print their PnL to their own terminal.)",
+                )
+                .small()
+                .color(muted),
+            );
+            return;
+        }
+
+        let elapsed = match (self.sim_stopped_after_s, self.sim_started_at) {
+            (Some(s), _) => s,
+            (None, Some(t)) => t.elapsed().as_secs_f64(),
+            _ => 0.0,
+        };
+        let status = if self.demo_sim_running.is_some() {
+            RichText::new(format!("● LIVE  t = {elapsed:.1}s")).color(green).strong()
+        } else {
+            RichText::new(format!("■ FINAL RESULTS  (ran {elapsed:.1}s)"))
+                .color(Color32::WHITE)
+                .strong()
+        };
+
+        // Rank bots by PnL (best first)
+        let mut rows: Vec<(usize, &SimBot, itch_ouch_sim::bot::BotPnl)> = self
+            .sim_bots
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, b, b.state.pnl_snapshot()))
+            .collect();
+        rows.sort_by(|a, b| b.2.mtm_pnl_fp.cmp(&a.2.mtm_pnl_fp));
+        let total_fp: i64 = rows.iter().map(|r| r.2.mtm_pnl_fp).sum();
+
+        ui.columns(2, |cols| {
+            // ---- Left: Leaderboard table ----
+            let ui = &mut cols[0];
+            ui.horizontal(|ui| {
+                ui.label(status);
+                ui.label(
+                    RichText::new(format!(
+                        "| Net of all bots: ${:+.2}",
+                        total_fp as f64 / PRICE_SCALE as f64
+                    ))
+                    .small()
+                    .color(muted),
+                );
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("bot_pnl_grid")
+                .striped(true)
+                .spacing([14.0, 4.0])
+                .show(ui, |ui| {
+                    for h in ["#", "BOT", "MTM PnL", "POSITION", "CASH", "MARK", "FILLS", "ORDERS"] {
+                        ui.label(RichText::new(h).small().color(muted));
+                    }
+                    ui.end_row();
+
+                    for (rank, (idx, bot, p)) in rows.iter().enumerate() {
+                        let color = BOT_COLORS[*idx % BOT_COLORS.len()];
+                        let pnl = p.mtm_pnl_fp as f64 / PRICE_SCALE as f64;
+                        let pnl_col = if pnl > 0.0 {
+                            green
+                        } else if pnl < 0.0 {
+                            red
+                        } else {
+                            Color32::WHITE
+                        };
+                        let medal = match rank {
+                            0 => "🥇",
+                            1 => "🥈",
+                            2 => "🥉",
+                            _ => "",
+                        };
+                        ui.label(RichText::new(format!("{medal}{}", rank + 1)).strong());
+                        ui.label(RichText::new(bot.state.name.trim()).strong().color(color));
+                        ui.label(
+                            RichText::new(format!("${pnl:+.2}"))
+                                .monospace()
+                                .strong()
+                                .color(pnl_col),
+                        );
+                        ui.label(RichText::new(format!("{:+} sh", p.position)).monospace());
+                        ui.label(
+                            RichText::new(format!(
+                                "${:+.2}",
+                                p.cash_fp as f64 / PRICE_SCALE as f64
+                            ))
+                            .monospace()
+                            .color(muted),
+                        );
+                        ui.label(
+                            RichText::new(format!("${}", fmt_price(p.mark_fp)))
+                                .monospace()
+                                .color(muted),
+                        );
+                        ui.label(RichText::new(format!("{}", p.fills)).monospace());
+                        ui.label(
+                            RichText::new(format!("{} / {}x", p.acks, p.cancels))
+                                .monospace()
+                                .color(muted),
+                        );
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("MTM PnL = cash + position × mid price (marked to each bot's shadow book).")
+                    .small()
+                    .color(muted),
+            );
+
+            // ---- Right: PnL over time chart ----
+            let ui = &mut cols[1];
+            Plot::new("bot_pnl_plot")
+                .legend(Legend::default())
+                .allow_scroll(false)
+                .y_axis_label("PnL ($)")
+                .x_axis_label("sim time (s)")
+                .show(ui, |plot_ui| {
+                    for (i, bot) in self.sim_bots.iter().enumerate() {
+                        if bot.pnl_history.is_empty() {
+                            continue;
+                        }
+                        plot_ui.line(
+                            Line::new(PlotPoints::new(bot.pnl_history.clone()))
+                                .name(bot.state.name.trim())
+                                .color(BOT_COLORS[i % BOT_COLORS.len()])
+                                .width(2.0_f32),
+                        );
+                    }
+                });
+        });
     }
 
     fn submit_order(&mut self) {
@@ -702,6 +887,7 @@ impl eframe::App for ItchGuiApp {
 
         // 1. Drain OUCH Execution Reports & Acks
         self.process_ouch_events();
+        self.sample_bot_pnl(false);
 
         // 2. Snapshot Market Feed under lock
         let (
@@ -1264,6 +1450,27 @@ impl eframe::App for ItchGuiApp {
                         self.bottom_tab = BottomTab::TimeAndSales;
                     }
 
+                    let bot_tab_title = if self.sim_bots.is_empty() {
+                        "🤖 BOT PnL".to_string()
+                    } else {
+                        let best = self
+                            .sim_bots
+                            .iter()
+                            .map(|b| b.state.pnl_snapshot().mtm_pnl_fp)
+                            .max()
+                            .unwrap_or(0);
+                        format!("🤖 BOT PnL (best ${:+.0})", best as f64 / PRICE_SCALE as f64)
+                    };
+                    if ui
+                        .selectable_label(
+                            self.bottom_tab == BottomTab::BotPnl,
+                            RichText::new(bot_tab_title).strong(),
+                        )
+                        .clicked()
+                    {
+                        self.bottom_tab = BottomTab::BotPnl;
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
@@ -1558,6 +1765,10 @@ impl eframe::App for ItchGuiApp {
                                     });
                                 }
                             });
+                    }
+
+                    BottomTab::BotPnl => {
+                        self.render_bot_pnl_tab(ui, green, red, muted);
                     }
                 }
             });

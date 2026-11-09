@@ -266,6 +266,18 @@ impl ShadowBook {
     }
 }
 
+/// Point-in-time PnL snapshot of a bot (all monetary values in fixed-point 1/10_000 dollars)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BotPnl {
+    pub position: i64,
+    pub cash_fp: i64,
+    pub mark_fp: u64,
+    pub mtm_pnl_fp: i64,
+    pub fills: u64,
+    pub acks: u64,
+    pub cancels: u64,
+}
+
 /// Shared bot telemetry & position tracking across its concurrent strategies
 pub struct BotState {
     pub name: String,
@@ -295,6 +307,22 @@ impl BotState {
 
     pub fn next_id(&self) -> u64 {
         self.next_cl_ord_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Point-in-time PnL / activity snapshot, marked to the bot's own shadow-book mid price.
+    pub fn pnl_snapshot(&self) -> BotPnl {
+        let mark_fp = self.book.read().unwrap().mid_price();
+        let position = self.position.load(Ordering::Relaxed);
+        let cash_fp = self.cash_fp.load(Ordering::Relaxed);
+        BotPnl {
+            position,
+            cash_fp,
+            mark_fp,
+            mtm_pnl_fp: cash_fp + position * (mark_fp as i64),
+            fills: self.fills_count.load(Ordering::Relaxed),
+            acks: self.acks_count.load(Ordering::Relaxed),
+            cancels: self.cancels_count.load(Ordering::Relaxed),
+        }
     }
 
     pub fn summary(&self) -> String {
