@@ -471,10 +471,22 @@ impl ItchGuiApp {
                     Arc::clone(&running),
                 );
 
+                let (name3, strat3) = default_strategies_for_bot(3);
+                let _ = spawn_bot(
+                    name3,
+                    3,
+                    &ouch_addr,
+                    mcast_group,
+                    mcast_port,
+                    &nak_addr,
+                    strat3,
+                    Arc::clone(&running),
+                );
+
                 self.demo_sim_running = Some(sim_flag);
                 self.ouch_addr = ouch_addr.clone();
                 let _ = self.ouch_client.connect(&ouch_addr);
-                self.status_msg = format!("Built-in Exchange + 2 Bots running on {ouch_addr}");
+                self.status_msg = format!("Built-in Exchange + 3 Bots running on {ouch_addr}");
             }
             Err(e) => {
                 self.status_msg = format!("Exchange port busy ({e}) — listening passively");
@@ -768,7 +780,7 @@ impl eframe::App for ItchGuiApp {
                     let sim_btn_label = if self.demo_sim_running.is_some() {
                         RichText::new("⏹ Stop Built-in Sim").color(red).strong()
                     } else {
-                        RichText::new("▶ Start Built-in Sim (Exchange + 2 Bots)")
+                        RichText::new("▶ Start Built-in Sim (Exchange + 3 Bots)")
                             .color(green)
                             .strong()
                     };

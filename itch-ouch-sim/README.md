@@ -1,6 +1,6 @@
 # `itch-ouch-sim` — Single-Threaded PGM ITCH / TCP OUCH Exchange, Multi-Strategy Bots & Real-Time GUI Client
 
-A high-performance, cross-platform (Windows & Linux/macOS) Rust implementation of a **single-threaded price-time priority matching engine**, **two multi-strategy trading bots**, and an **interactive real-time desktop GUI trading terminal** communicating over **NASDAQ OUCH 5.0 (TCP)** and **PGM-encapsulated NASDAQ ITCH 5.0 (IPv4 Reliable Multicast)**.
+A high-performance, cross-platform (Windows & Linux/macOS) Rust implementation of a **single-threaded price-time priority matching engine**, **three multi-strategy trading bots (including a quantitative microstructure smart bot)**, and an **interactive real-time desktop GUI trading terminal** communicating over **NASDAQ OUCH 5.0 (TCP)** and **PGM-encapsulated NASDAQ ITCH 5.0 (IPv4 Reliable Multicast)**.
 
 ---
 
@@ -28,6 +28,16 @@ flowchart LR
         B2PGM --> B2GW
     end
 
+    subgraph Bot3["Bot 3 — Smart Bot (bin/bot --id 3)"]
+        B3S1["Strategy 1: AvellanedaStoikovMM"]
+        B3S2["Strategy 2: MicropriceImbalanceAlpha"]
+        B3GW["OUCH TCP Gateway + Microstructure ShadowBook"]
+        B3PGM["PgmSubscriber (239.255.0.1:30001)"]
+        B3S1 --> B3GW
+        B3S2 --> B3GW
+        B3PGM --> B3GW
+    end
+
     subgraph GUI["Terminal / Trader (bin/itch_client)"]
         GUI_CHART["Price Chart + L2 Depth Ladder"]
         GUI_OE["OUCH Order Entry + Blotter (Cancel/Cancel All)"]
@@ -45,12 +55,15 @@ flowchart LR
 
     B1GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
     B2GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
+    B3GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
     GUI_OE <-- "TCP OUCH (127.0.0.1:40000)" --> EL
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B1PGM
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B2PGM
+    PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B3PGM
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> GUI_PGM
     B1PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
     B2PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
+    B3PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
     GUI_PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
 ```
 
@@ -63,10 +76,10 @@ flowchart LR
 | `src/protocol.rs` | Fixed-size, Big-Endian (network byte order) binary wire frames for **OUCH Inbound** (`EnterOrder`, `CancelOrder` — 22 B), **OUCH Outbound** (`OrderAccepted`, `OrderExecuted`, `OrderCanceled` — 30 B), and **ITCH 5.0** (`OrderAdded`, `OrderExecuted`, `OrderDeleted` — 30 B). Prices use 4-decimal fixed-point representation (`PRICE_SCALE = 10_000`). |
 | `src/pgm.rs` | **RFC 3208 UDP-Encapsulated Pragmatic General Multicast (PGM)** layer (52-byte frames): supports `PGM_SPM` (`0x00`) heartbeats, `PGM_ODATA` (`0x04`) original multicast data, `PGM_RDATA` (`0x05`) repair retransmissions from a 65,536-slot circular transmit window, `PGM_NAK` (`0x08`) gap requests, and `PGM_NCF` (`0x09`) NAK confirmations. Fully cross-platform: uses `SO_REUSEADDR` + `SO_REUSEPORT` on POSIX/macOS and Winsock2 (`ws2_32`) on Windows with loopback multicast interface setup. |
 | `src/exchange.rs` | Single-threaded non-blocking limit order book and matching engine (`ExchangeServer`). Zero locks or mutex contention on the matching path. |
-| `src/bot.rs` | Multi-threaded bot client (`spawn_bot`) with a dedicated PGM ITCH receiver thread (maintaining a local `ShadowBook`), a TCP OUCH reader thread (tracking real-time inventory and mark-to-market PnL), a serialized TCP OUCH writer thread (`mpsc::Receiver<OuchInbound>`), and **2 concurrent strategy threads**. |
+| `src/bot.rs` | Multi-threaded bot client (`spawn_bot`) with a dedicated PGM ITCH receiver thread (maintaining a local `ShadowBook` with microprice, multi-level Order Book Imbalance, EWMA volatility, and order-flow toxicity analytics), a TCP OUCH reader thread (tracking real-time inventory and mark-to-market PnL), a serialized TCP OUCH writer thread (`mpsc::Receiver<OuchInbound>`), and **2 concurrent strategy threads**. |
 | `src/bin/exchange.rs` | Standalone Exchange Server executable (`exchange`). |
 | `src/bin/bot.rs` | Standalone Trading Bot executable (`bot`). |
-| `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange and both bots. |
+| `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange and all three bots. |
 | `src/bin/itch_client.rs` | Real-time **desktop GUI trading terminal** built with `eframe` / `egui` and `egui_plot`, featuring live price charts, L2 market depth ladder, interactive OUCH order submission/cancellation, order blotter with MTM PnL tracking, public Time & Sales tape, and a CLI fallback mode (`--cli`). |
 
 ---
@@ -93,7 +106,7 @@ The `itch_client` application provides an institutional-grade monitoring and tra
 5. **Time & Sales (Trade Tape)**:
    - Full public market execution stream showing timestamp, sequence number, order reference, side, shares, and execution price.
 6. **1-Click Built-in Simulator**:
-   - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 2 trading bots and auto-connect OUCH with zero configuration.
+   - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 3 trading bots and auto-connect OUCH with zero configuration.
 
 ---
 
@@ -105,6 +118,9 @@ The `itch_client` application provides an institutional-grade monitoring and tra
 2. **Bot 2 (`--id 2`)**:
    * **Momentum Sniper**: Tracks aggressive buy vs. sell execution volume imbalance from the ITCH feed and snipes top-of-book liquidity in the direction of order flow.
    * **Liquidity Taker**: Periodically sweeps top-of-book quotes to generate continuous tape activity.
+3. **Bot 3 — Smart Quantitative Bot (`--id 3`)**:
+   * **Avellaneda-Stoikov Adaptive Market Maker (`AvellanedaStoikovMM`)**: Computes a continuous reservation price $r(s, q) = s_{\text{fair}} - q \cdot \gamma \cdot \sigma$ around the composite microstructure fair value, dynamically scales half-spreads with EWMA realized volatility $\sigma$ and order-flow toxicity, applies asymmetric adverse-selection protection against informed flow, preserves queue priority when quotes are within tolerance, and enforces hard inventory caps.
+   * **Microprice & Order-Book Imbalance Alpha (`MicropriceImbalanceAlpha`)**: Combines volume-weighted top-of-book microprice, 5-level exponentially weighted Order Book Imbalance (OBI), and EWMA signed trade flow to snipe mispriced top-of-book liquidity or passively peg/improve the BBO to unwind inventory.
 
 ---
 
@@ -158,4 +174,9 @@ cargo run --release --bin bot -- --id 1 --duration-ms 5000
 **Terminal 4 — Start Bot 2 (Momentum Sniper + Liquidity Taker):**
 ```bash
 cargo run --release --bin bot -- --id 2 --duration-ms 5000
+```
+
+**Terminal 5 — Start Bot 3 (Smart Avellaneda-Stoikov MM + Microprice/OBI Alpha):**
+```bash
+cargo run --release --bin bot -- --id 3 --duration-ms 5000
 ```
