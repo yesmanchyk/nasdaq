@@ -423,6 +423,21 @@ pub enum StrategyKind {
         lot_size: u32,
         max_inventory: i64,
     },
+    /// Online Tabular Q-Learning Market Maker learning optimal quote spreads & skews
+    /// across 45 (inventory × OBI × volatility/toxicity) states via Bellman TD(0) updates
+    TabularQLearningMM {
+        lot_size: u32,
+        max_inventory: i64,
+        learning_rate_bps: u64,
+        discount_bps: u64,
+    },
+    /// Online Contextual UCB1 Bandit learning when to snipe ask, hit bid, peg BBO, or hold
+    /// across 9 (order-book imbalance × order-flow toxicity) market regimes
+    ContextualBanditTaker {
+        lot_size: u32,
+        max_inventory: i64,
+        exploration_bps: u64,
+    },
 }
 
 pub fn default_strategies_for_bot(bot_id: u64) -> (&'static str, [StrategyKind; 2]) {
@@ -447,7 +462,7 @@ pub fn default_strategies_for_bot(bot_id: u64) -> (&'static str, [StrategyKind; 
                 StrategyKind::LiquidityTaker { lot_size: 60 },
             ],
         ),
-        _ => (
+        3 => (
             "Bot-3 (Smart AS+OBI)",
             [
                 StrategyKind::AvellanedaStoikovMM {
@@ -460,6 +475,22 @@ pub fn default_strategies_for_bot(bot_id: u64) -> (&'static str, [StrategyKind; 
                     edge_threshold: 8,
                     lot_size: 50,
                     max_inventory: 600,
+                },
+            ],
+        ),
+        _ => (
+            "Bot-4 (RL Q+Bandit) ",
+            [
+                StrategyKind::TabularQLearningMM {
+                    lot_size: 75,
+                    max_inventory: 600,
+                    learning_rate_bps: 1800, // alpha = 0.18
+                    discount_bps: 9200,      // gamma = 0.92
+                },
+                StrategyKind::ContextualBanditTaker {
+                    lot_size: 45,
+                    max_inventory: 600,
+                    exploration_bps: 1200, // c = 0.12
                 },
             ],
         ),
@@ -641,6 +672,12 @@ fn run_strategy(
     let mut active_orders: Vec<u64> = Vec::new();
     let mut resting_bid: Option<(u64, u64)> = None; // (cl_ord_id, price)
     let mut resting_ask: Option<(u64, u64)> = None; // (cl_ord_id, price)
+    let mut q_learner: Option<QLearningTable> = None;
+    let mut prev_q_step: Option<(usize, usize, i64)> = None; // (state, action, mtm_pnl_fp)
+    let mut bandit_learner: Option<ContextualBandit> = None;
+    let mut prev_bandit_step: Option<(usize, usize, i64)> = None; // (ctx, arm, mtm_pnl_fp)
+    let mut rng_state: u64 =
+        0x9E37_79B9_7F4A_7C15 ^ (strat_idx as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     let mut tick: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
@@ -1029,10 +1066,492 @@ fn run_strategy(
 
                 thread::sleep(Duration::from_millis(4));
             }
+
+            StrategyKind::TabularQLearningMM {
+                lot_size,
+                max_inventory,
+                learning_rate_bps,
+                discount_bps,
+            } => {
+                // Lazy-init local Q-learning state on tick == 1 across loop iterations
+                let q_agent = q_learner.get_or_insert_with(QLearningTable::new_with_priors);
+                let alpha = (learning_rate_bps as f64 / 10_000.0).clamp(0.01, 0.99);
+                let gamma = (discount_bps as f64 / 10_000.0).clamp(0.0, 0.999);
+
+                let (fair_px, obi, vol, toxicity, best_bid, best_ask) = {
+                    let b = state.book.read().unwrap();
+                    (
+                        b.smart_fair_value(),
+                        b.order_book_imbalance(5),
+                        b.ewma_volatility_fp(),
+                        b.order_flow_toxicity(),
+                        b.best_bid(),
+                        b.best_ask(),
+                    )
+                };
+                let snap = state.pnl_snapshot();
+                let pos = snap.position;
+                let cur_state = QLearningTable::encode_state(pos, obi, vol, toxicity);
+
+                // Online Bellman TD(0) update from previous transition (s, a, r, s')
+                if let Some((prev_state, prev_action, prev_pnl_fp)) = prev_q_step {
+                    let delta_pnl_dollars =
+                        (snap.mtm_pnl_fp - prev_pnl_fp) as f64 / (PRICE_SCALE as f64);
+                    // Quadratic inventory penalty encourages mean-reverting inventory control
+                    let inv_norm = (pos as f64) / 150.0;
+                    let reward = delta_pnl_dollars - 0.08 * (inv_norm * inv_norm);
+                    q_agent.update(prev_state, prev_action, reward, cur_state, alpha, gamma);
+                }
+
+                // Decaying epsilon-greedy exploration (starts at 18%, decays toward 3%)
+                let epsilon = (0.18 / (1.0 + (tick as f64) * 0.015)).max(0.03);
+                let action = q_agent.select_action(cur_state, epsilon, &mut rng_state);
+                prev_q_step = Some((cur_state, action, snap.mtm_pnl_fp));
+
+                let (bid_offset, ask_offset) = QLearningTable::action_offsets(action, pos);
+                let inv_skew = (pos / 80) * 3;
+                let center_px = (fair_px as i64 - inv_skew).max(10_000) as u64;
+
+                let mut target_bid = center_px.saturating_sub(bid_offset).max(10_000);
+                let mut target_ask = (center_px + ask_offset).max(10_001);
+
+                if let Some((a_px, _)) = best_ask {
+                    target_bid = target_bid.min(a_px.saturating_sub(1));
+                }
+                if let Some((b_px, _)) = best_bid {
+                    target_ask = target_ask.max(b_px + 1);
+                }
+                if target_ask <= target_bid {
+                    target_ask = target_bid + 2;
+                }
+
+                let force_refresh = tick.is_multiple_of(5);
+
+                if pos < max_inventory {
+                    let need_new_bid = match resting_bid {
+                        Some((_, old_px)) => force_refresh || old_px.abs_diff(target_bid) > 2,
+                        None => true,
+                    };
+                    if need_new_bid {
+                        if let Some((old_id, _)) = resting_bid.take() {
+                            let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                        }
+                        let bid_id = state.next_id();
+                        let _ = tx.send(OuchInbound::EnterOrder {
+                            cl_ord_id: bid_id,
+                            side: Side::Buy,
+                            shares: lot_size,
+                            price: target_bid,
+                        });
+                        resting_bid = Some((bid_id, target_bid));
+                    }
+                } else if let Some((old_id, _)) = resting_bid.take() {
+                    let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                }
+
+                if pos > -max_inventory {
+                    let need_new_ask = match resting_ask {
+                        Some((_, old_px)) => force_refresh || old_px.abs_diff(target_ask) > 2,
+                        None => true,
+                    };
+                    if need_new_ask {
+                        if let Some((old_id, _)) = resting_ask.take() {
+                            let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                        }
+                        let ask_id = state.next_id();
+                        let _ = tx.send(OuchInbound::EnterOrder {
+                            cl_ord_id: ask_id,
+                            side: Side::Sell,
+                            shares: lot_size,
+                            price: target_ask,
+                        });
+                        resting_ask = Some((ask_id, target_ask));
+                    }
+                } else if let Some((old_id, _)) = resting_ask.take() {
+                    let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                }
+
+                thread::sleep(Duration::from_millis(4));
+            }
+
+            StrategyKind::ContextualBanditTaker {
+                lot_size,
+                max_inventory,
+                exploration_bps,
+            } => {
+                for old_id in active_orders.drain(..) {
+                    let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                }
+
+                let bandit = bandit_learner.get_or_insert_with(ContextualBandit::new_with_priors);
+                let exploration_c = (exploration_bps as f64 / 10_000.0).max(0.01);
+
+                let (smart_fv, obi, toxicity, best_bid, best_ask) = {
+                    let b = state.book.read().unwrap();
+                    (
+                        b.smart_fair_value(),
+                        b.order_book_imbalance(5),
+                        b.order_flow_toxicity(),
+                        b.best_bid(),
+                        b.best_ask(),
+                    )
+                };
+                let snap = state.pnl_snapshot();
+                let pos = snap.position;
+
+                // Online contextual bandit update from previous step's realized reward
+                if let Some((prev_ctx, prev_arm, prev_pnl_fp)) = prev_bandit_step {
+                    let delta_pnl_dollars =
+                        (snap.mtm_pnl_fp - prev_pnl_fp) as f64 / (PRICE_SCALE as f64);
+                    let inv_norm = (pos as f64) / 200.0;
+                    let reward = delta_pnl_dollars - 0.05 * (inv_norm * inv_norm);
+                    bandit.update(prev_ctx, prev_arm, reward);
+                }
+
+                let ctx = ContextualBandit::encode_context(obi, toxicity);
+                let arm = bandit.select_arm(ctx, pos, max_inventory, exploration_c);
+                prev_bandit_step = Some((ctx, arm, snap.mtm_pnl_fp));
+
+                match arm {
+                    // Arm 1: Snipe Ask (Aggressive Buy) when microprice/OBI supports it
+                    1 => {
+                        if pos < max_inventory
+                            && let Some((ask_px, _)) = best_ask
+                            && smart_fv + 4 >= ask_px
+                        {
+                            let id = state.next_id();
+                            let _ = tx.send(OuchInbound::EnterOrder {
+                                cl_ord_id: id,
+                                side: Side::Buy,
+                                shares: lot_size,
+                                price: ask_px + 2,
+                            });
+                            active_orders.push(id);
+                        }
+                    }
+                    // Arm 2: Hit Bid (Aggressive Sell) when microprice/OBI supports it
+                    2 => {
+                        if pos > -max_inventory
+                            && let Some((bid_px, _)) = best_bid
+                            && smart_fv <= bid_px + 4
+                        {
+                            let id = state.next_id();
+                            let _ = tx.send(OuchInbound::EnterOrder {
+                                cl_ord_id: id,
+                                side: Side::Sell,
+                                shares: lot_size,
+                                price: bid_px.saturating_sub(2),
+                            });
+                            active_orders.push(id);
+                        }
+                    }
+                    // Arm 3: Passive BBO Peg on Microprice-Favored or Inventory-Unwinding Side
+                    3 => {
+                        if (obi >= 0.0 || pos < -100)
+                            && pos < max_inventory
+                            && let Some((bid_px, _)) = best_bid
+                        {
+                            let peg_px = match best_ask {
+                                Some((ask_px, _)) if ask_px > bid_px + 2 => bid_px + 1,
+                                _ => bid_px,
+                            };
+                            let id = state.next_id();
+                            let _ = tx.send(OuchInbound::EnterOrder {
+                                cl_ord_id: id,
+                                side: Side::Buy,
+                                shares: lot_size,
+                                price: peg_px,
+                            });
+                            active_orders.push(id);
+                        } else if pos > -max_inventory
+                            && let Some((ask_px, _)) = best_ask
+                        {
+                            let peg_px = match best_bid {
+                                Some((bid_px, _)) if ask_px > bid_px + 2 => ask_px - 1,
+                                _ => ask_px,
+                            };
+                            let id = state.next_id();
+                            let _ = tx.send(OuchInbound::EnterOrder {
+                                cl_ord_id: id,
+                                side: Side::Sell,
+                                shares: lot_size,
+                                price: peg_px,
+                            });
+                            active_orders.push(id);
+                        }
+                    }
+                    // Arm 0: Hold / No-Op
+                    _ => {}
+                }
+
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
     let _ = fmt_price(0);
+}
+
+// ============================================================================
+// Online Reinforcement Learning Primitives (Tabular Q-Learning + Contextual UCB1)
+// ============================================================================
+
+/// Fast xorshift64 PRNG for lock-free epsilon-greedy exploration
+#[inline]
+fn next_u64_rng(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Tabular Q-Learning agent over 45 discrete microstructure states and 6 quoting actions.
+///
+/// State factorization (`5 * 3 * 3 = 45`):
+/// - Inventory bucket (`0..5`): Deep Short, Mild Short, Neutral, Mild Long, Deep Long
+/// - Order-Book Imbalance (`0..3`): Bearish (`< -0.15`), Balanced, Bullish (`> +0.15`)
+/// - Volatility / Toxicity (`0..3`): Calm, Moderate, Turbulent/Toxic
+pub struct QLearningTable {
+    pub q: [[f64; Self::NUM_ACTIONS]; Self::NUM_STATES],
+    pub updates: u64,
+}
+
+impl QLearningTable {
+    pub const NUM_STATES: usize = 45;
+    pub const NUM_ACTIONS: usize = 6;
+
+    pub fn new_with_priors() -> Self {
+        let mut q = [[0.0; Self::NUM_ACTIONS]; Self::NUM_STATES];
+        for inv_idx in 0..5 {
+            for obi_idx in 0..3 {
+                for vol_idx in 0..3 {
+                    let s = inv_idx * 9 + obi_idx * 3 + vol_idx;
+                    // Action 0: Tight Symmetric (9, 9) — good when calm and neutral inventory
+                    q[s][0] = if vol_idx == 0 && inv_idx == 2 { 0.25 } else { 0.05 };
+                    // Action 1: Moderate Symmetric (16, 16) — balanced baseline
+                    q[s][1] = 0.20;
+                    // Action 2: Wide Defensive (28, 28) — best when vol/toxicity is high
+                    q[s][2] = if vol_idx == 2 { 0.35 } else { 0.10 };
+                    // Action 3: Skew Bid / Accumulate Long (6, 24) — favored when short or bullish OBI
+                    q[s][3] = if inv_idx <= 1 || obi_idx == 2 { 0.30 } else { -0.05 };
+                    // Action 4: Skew Ask / Accumulate Short (24, 6) — favored when long or bearish OBI
+                    q[s][4] = if inv_idx >= 3 || obi_idx == 0 { 0.30 } else { -0.05 };
+                    // Action 5: Inventory-Flattening Peg — strongly favored at extreme inventory
+                    q[s][5] = if inv_idx == 0 || inv_idx == 4 { 0.40 } else { 0.12 };
+                }
+            }
+        }
+        Self { q, updates: 0 }
+    }
+
+    pub fn encode_state(pos: i64, obi: f64, vol: f64, toxicity: f64) -> usize {
+        let inv_idx = if pos < -250 {
+            0
+        } else if pos < -50 {
+            1
+        } else if pos <= 50 {
+            2
+        } else if pos <= 250 {
+            3
+        } else {
+            4
+        };
+
+        let obi_idx = if obi < -0.15 {
+            0
+        } else if obi > 0.15 {
+            2
+        } else {
+            1
+        };
+
+        let tox_abs = toxicity.abs();
+        let vol_idx = if vol >= 18.0 || tox_abs >= 0.50 {
+            2
+        } else if vol < 8.0 && tox_abs < 0.25 {
+            0
+        } else {
+            1
+        };
+
+        inv_idx * 9 + obi_idx * 3 + vol_idx
+    }
+
+    pub fn select_action(&self, state: usize, epsilon: f64, rng_state: &mut u64) -> usize {
+        let s = state.min(Self::NUM_STATES - 1);
+        let rand_01 = (next_u64_rng(rng_state) >> 11) as f64 / ((1u64 << 53) as f64);
+        if rand_01 < epsilon {
+            (next_u64_rng(rng_state) as usize) % Self::NUM_ACTIONS
+        } else {
+            let mut best_a = 0;
+            let mut best_q = self.q[s][0];
+            for (a, &val) in self.q[s].iter().enumerate().skip(1) {
+                if val > best_q {
+                    best_q = val;
+                    best_a = a;
+                }
+            }
+            best_a
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        prev_state: usize,
+        action: usize,
+        reward: f64,
+        next_state: usize,
+        alpha: f64,
+        gamma: f64,
+    ) -> f64 {
+        let s = prev_state.min(Self::NUM_STATES - 1);
+        let a = action.min(Self::NUM_ACTIONS - 1);
+        let ns = next_state.min(Self::NUM_STATES - 1);
+
+        let max_next_q = self.q[ns]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let td_target = reward + gamma * max_next_q;
+        let td_error = td_target - self.q[s][a];
+        self.q[s][a] += alpha * td_error;
+        self.updates += 1;
+        td_error
+    }
+
+    /// Maps discrete action `0..6` to `(bid_half_spread, ask_half_spread)` in fixed-point ticks.
+    pub fn action_offsets(action: usize, pos: i64) -> (u64, u64) {
+        match action {
+            0 => (9, 9),   // Tight Symmetric
+            1 => (16, 16), // Moderate Symmetric
+            2 => (28, 28), // Wide Defensive
+            3 => (6, 24),  // Skew Bid (accumulate long / cover short)
+            4 => (24, 6),  // Skew Ask (accumulate short / unwind long)
+            _ => {
+                // Action 5: Inventory-flattening peg
+                if pos > 40 {
+                    (26, 5)
+                } else if pos < -40 {
+                    (5, 26)
+                } else {
+                    (12, 12)
+                }
+            }
+        }
+    }
+}
+
+/// Online Contextual UCB1 Bandit over 9 market regimes (`3 OBI × 3 Toxicity`) and 4 execution arms:
+/// - Arm `0`: Hold / Wait
+/// - Arm `1`: Snipe Ask (Aggressive Buy)
+/// - Arm `2`: Hit Bid (Aggressive Sell)
+/// - Arm `3`: Passive BBO Peg on Microprice Side
+pub struct ContextualBandit {
+    pub mean_reward: [[f64; Self::NUM_ARMS]; Self::NUM_CONTEXTS],
+    pub counts: [[u64; Self::NUM_ARMS]; Self::NUM_CONTEXTS],
+    pub context_visits: [u64; Self::NUM_CONTEXTS],
+}
+
+impl ContextualBandit {
+    pub const NUM_CONTEXTS: usize = 9;
+    pub const NUM_ARMS: usize = 4;
+
+    pub fn new_with_priors() -> Self {
+        let mut mean_reward = [[0.0; Self::NUM_ARMS]; Self::NUM_CONTEXTS];
+        let counts = [[1u64; Self::NUM_ARMS]; Self::NUM_CONTEXTS];
+        let context_visits = [4u64; Self::NUM_CONTEXTS];
+
+        for obi_idx in 0..3 {
+            for tox_idx in 0..3 {
+                let ctx = obi_idx * 3 + tox_idx;
+                // Arm 0: Hold
+                mean_reward[ctx][0] = 0.05;
+                // Arm 1: Snipe Ask — prior boost when OBI & flow are bullish (obi_idx == 2, tox_idx >= 1)
+                mean_reward[ctx][1] = if obi_idx == 2 && tox_idx >= 1 {
+                    0.35
+                } else {
+                    -0.10
+                };
+                // Arm 2: Hit Bid — prior boost when OBI & flow are bearish (obi_idx == 0, tox_idx <= 1)
+                mean_reward[ctx][2] = if obi_idx == 0 && tox_idx <= 1 {
+                    0.35
+                } else {
+                    -0.10
+                };
+                // Arm 3: Passive BBO Peg
+                mean_reward[ctx][3] = 0.18;
+            }
+        }
+
+        Self {
+            mean_reward,
+            counts,
+            context_visits: context_visits,
+        }
+    }
+
+    pub fn encode_context(obi: f64, toxicity: f64) -> usize {
+        let obi_idx = if obi < -0.12 {
+            0
+        } else if obi > 0.12 {
+            2
+        } else {
+            1
+        };
+        let tox_idx = if toxicity < -0.15 {
+            0
+        } else if toxicity > 0.15 {
+            2
+        } else {
+            1
+        };
+        obi_idx * 3 + tox_idx
+    }
+
+    pub fn select_arm(&self, ctx: usize, pos: i64, max_inventory: i64, exploration_c: f64) -> usize {
+        let c = ctx.min(Self::NUM_CONTEXTS - 1);
+        let total_n = (self.context_visits[c].max(1) as f64).ln();
+
+        let mut best_arm = 0;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for arm in 0..Self::NUM_ARMS {
+            // Disallow inventory-increasing aggressive arms at inventory cap
+            if arm == 1 && pos >= max_inventory {
+                continue;
+            }
+            if arm == 2 && pos <= -max_inventory {
+                continue;
+            }
+            let n = self.counts[c][arm].max(1) as f64;
+            let ucb_bonus = exploration_c * (total_n / n).sqrt();
+            // Mild inventory-unwinding preference
+            let inv_bonus = match arm {
+                1 if pos < -100 => 0.10,
+                2 if pos > 100 => 0.10,
+                _ => 0.0,
+            };
+            let score = self.mean_reward[c][arm] + ucb_bonus + inv_bonus;
+            if score > best_score {
+                best_score = score;
+                best_arm = arm;
+            }
+        }
+
+        best_arm
+    }
+
+    pub fn update(&mut self, ctx: usize, arm: usize, reward: f64) {
+        let c = ctx.min(Self::NUM_CONTEXTS - 1);
+        let a = arm.min(Self::NUM_ARMS - 1);
+        self.counts[c][a] += 1;
+        self.context_visits[c] += 1;
+        // Exponentially recency-weighted mean update for non-stationary order book dynamics
+        const BETA: f64 = 0.15;
+        self.mean_reward[c][a] = (1.0 - BETA) * self.mean_reward[c][a] + BETA * reward;
+    }
 }
 
 #[cfg(test)]
@@ -1102,11 +1621,13 @@ mod tests {
         let bot1 = BotState::new("Bot-1", 1);
         let bot2 = BotState::new("Bot-2", 2);
         let bot3 = BotState::new("Bot-3", 3);
+        let bot4 = BotState::new("Bot-4", 4);
 
-        // All bots start with the exact same fixed capital ($100,000.00) and $0.00 net PnL
+        // All 4 bots start with the exact same fixed capital ($100,000.00) and $0.00 net PnL
         assert_eq!(bot1.initial_capital_fp, INITIAL_BOT_CAPITAL_FP);
         assert_eq!(bot1.initial_capital_fp, bot2.initial_capital_fp);
         assert_eq!(bot2.initial_capital_fp, bot3.initial_capital_fp);
+        assert_eq!(bot3.initial_capital_fp, bot4.initial_capital_fp);
 
         let snap = bot1.pnl_snapshot();
         assert_eq!(snap.cash_fp, INITIAL_BOT_CAPITAL_FP);
@@ -1126,6 +1647,35 @@ mod tests {
             bot1.affordable_shares(Side::Buy, 100, 100 * PRICE_SCALE),
             0
         );
+    }
+
+    #[test]
+    fn test_rl_bot4_q_learning_and_contextual_bandit() {
+        let (name, strats) = default_strategies_for_bot(4);
+        assert!(name.contains("Bot-4"));
+        assert!(matches!(strats[0], StrategyKind::TabularQLearningMM { .. }));
+        assert!(matches!(
+            strats[1],
+            StrategyKind::ContextualBanditTaker { .. }
+        ));
+
+        // Verify Tabular Q-Learning Bellman update shifts greedy action toward high-reward action
+        let mut q_table = QLearningTable::new_with_priors();
+        let s = QLearningTable::encode_state(0, 0.0, 5.0, 0.0);
+        let mut rng = 0x1234_5678_9abc_def0;
+        for _ in 0..10 {
+            q_table.update(s, 3, 5.0, s, 0.25, 0.90);
+        }
+        assert_eq!(q_table.select_action(s, 0.0, &mut rng), 3);
+
+        // Verify Contextual UCB1 Bandit learns to prefer profitable arm in a given context
+        let mut bandit = ContextualBandit::new_with_priors();
+        let ctx = ContextualBandit::encode_context(0.30, 0.40);
+        for _ in 0..10 {
+            bandit.update(ctx, 1, 2.5);
+            bandit.update(ctx, 2, -2.0);
+        }
+        assert_eq!(bandit.select_arm(ctx, 0, 600, 0.05), 1);
     }
 }
 

@@ -9,6 +9,7 @@
 //!   cargo run --release --bin bot -- --id 1
 //!   cargo run --release --bin bot -- --id 2
 //!   cargo run --release --bin bot -- --id 3
+//!   cargo run --release --bin bot -- --id 4
 
 use itch_ouch_sim::bot::{default_strategies_for_bot, spawn_bot};
 use itch_ouch_sim::pgm::{

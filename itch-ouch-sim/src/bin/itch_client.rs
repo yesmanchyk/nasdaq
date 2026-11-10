@@ -346,10 +346,11 @@ struct SimBot {
     pnl_history: Vec<[f64; 2]>,
 }
 
-const BOT_COLORS: [Color32; 3] = [
+const BOT_COLORS: [Color32; 4] = [
     Color32::from_rgb(80, 190, 250),
     Color32::from_rgb(245, 190, 60),
     Color32::from_rgb(200, 120, 255),
+    Color32::from_rgb(50, 225, 150),
 ];
 
 struct ItchGuiApp {
@@ -474,7 +475,7 @@ impl ItchGuiApp {
                     .ok();
 
                 self.sim_bots.clear();
-                for bot_id in 1..=3u64 {
+                for bot_id in 1..=4u64 {
                     let (name, strats) = default_strategies_for_bot(bot_id);
                     match spawn_bot(
                         name,
@@ -539,7 +540,7 @@ impl ItchGuiApp {
             ui.add_space(12.0);
             ui.label(
                 RichText::new(
-                    "No built-in bots yet. Click ▶ Start Built-in Sim to run the Exchange + 3 Bots \
+                    "No built-in bots yet. Click ▶ Start Built-in Sim to run the Exchange + 4 Bots \
                      and track how much money each bot makes.",
                 )
                 .color(muted),
@@ -991,7 +992,7 @@ impl eframe::App for ItchGuiApp {
                     let sim_btn_label = if self.demo_sim_running.is_some() {
                         RichText::new("⏹ Stop Built-in Sim").color(red).strong()
                     } else {
-                        RichText::new("▶ Start Built-in Sim (Exchange + 3 Bots)")
+                        RichText::new("▶ Start Built-in Sim (Exchange + 4 Bots)")
                             .color(green)
                             .strong()
                     };

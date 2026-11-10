@@ -1,6 +1,6 @@
 //! Multi-Process / End-to-End Launcher (`sim`)
 //!
-//! Spawns the standalone `exchange` server and three standalone `bot` clients
+//! Spawns the standalone `exchange` server and four standalone `bot` clients
 //! connected via TCP OUCH (`127.0.0.1:40000`) and PGM Reliable Multicast ITCH
 //! (`239.255.0.1:30001`, NAK repair on `127.0.0.1:30002`).
 
@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(2_000);
 
     println!("====================================================================================================");
-    println!("  Standalone Single-Threaded Exchange (PGM ITCH + TCP OUCH) + 3 Multi-Strategy Bots (Rust)");
+    println!("  Standalone Single-Threaded Exchange (PGM ITCH + TCP OUCH) + 4 Multi-Strategy Bots (Rust)");
     println!("====================================================================================================");
 
     // 1. Bind standalone Exchange Server (TCP OUCH + PGM Multicast ITCH + PGM NAK repair)
@@ -48,7 +48,7 @@ fn main() -> std::io::Result<()> {
             exchange
         })?;
 
-    // 3. Connect Bot 1, Bot 2, and Bot 3 (Smart Bot) via PGM Multicast ITCH & TCP OUCH
+    // 3. Connect Bot 1, Bot 2, Bot 3 (Smart), and Bot 4 (RL) via PGM Multicast ITCH & TCP OUCH
     let (name1, strat1) = default_strategies_for_bot(1);
     let bot1 = spawn_bot(
         name1,
@@ -85,8 +85,20 @@ fn main() -> std::io::Result<()> {
         Arc::clone(&running),
     )?;
 
+    let (name4, strat4) = default_strategies_for_bot(4);
+    let bot4 = spawn_bot(
+        name4,
+        4,
+        &ouch_addr,
+        DEFAULT_MCAST_GROUP,
+        DEFAULT_MCAST_PORT,
+        DEFAULT_NAK_ADDR,
+        strat4,
+        Arc::clone(&running),
+    )?;
+
     println!(
-        "-> Connected Bot 1 [MarketMaker || MeanReversion], Bot 2 [MomentumSniper || LiquidityTaker], Bot 3 [AvellanedaStoikovMM || MicropriceImbalanceAlpha]\n"
+        "-> Connected Bot 1 [MM || MeanRev], Bot 2 [Mom || Taker], Bot 3 [Smart AS || OBI], Bot 4 [RL Q-Learn || Bandit]\n"
     );
 
     let start = Instant::now();
@@ -94,11 +106,12 @@ fn main() -> std::io::Result<()> {
     while start.elapsed() < Duration::from_millis(duration_ms) {
         thread::sleep(step);
         println!(
-            "t={:4}ms | {}\n         | {}\n         | {}",
+            "t={:4}ms | {}\n         | {}\n         | {}\n         | {}",
             start.elapsed().as_millis(),
             bot1.state.summary(),
             bot2.state.summary(),
-            bot3.state.summary()
+            bot3.state.summary(),
+            bot4.state.summary()
         );
     }
 
@@ -106,9 +119,11 @@ fn main() -> std::io::Result<()> {
     let bot1_final = bot1.state.summary();
     let bot2_final = bot2.state.summary();
     let bot3_final = bot3.state.summary();
+    let bot4_final = bot4.state.summary();
     bot1.join();
     bot2.join();
     bot3.join();
+    bot4.join();
     let exchange = exchange_thread.join().unwrap();
 
     println!("\n====================================================================================================");
@@ -118,6 +133,7 @@ fn main() -> std::io::Result<()> {
     println!("Bot 1    : {}", bot1_final);
     println!("Bot 2    : {}", bot2_final);
     println!("Bot 3    : {}", bot3_final);
+    println!("Bot 4    : {}", bot4_final);
 
     Ok(())
 }

@@ -38,6 +38,16 @@ flowchart LR
         B3PGM --> B3GW
     end
 
+    subgraph Bot4["Bot 4 — RL Bot (bin/bot --id 4)"]
+        B4S1["Strategy 1: TabularQLearningMM"]
+        B4S2["Strategy 2: ContextualBanditTaker"]
+        B4GW["OUCH TCP Gateway + Online RL State"]
+        B4PGM["PgmSubscriber (239.255.0.1:30001)"]
+        B4S1 --> B4GW
+        B4S2 --> B4GW
+        B4PGM --> B4GW
+    end
+
     subgraph GUI["Terminal / Trader (bin/itch_client)"]
         GUI_CHART["Price Chart + L2 Depth Ladder"]
         GUI_OE["OUCH Order Entry + Blotter (Cancel/Cancel All)"]
@@ -56,14 +66,17 @@ flowchart LR
     B1GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
     B2GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
     B3GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
+    B4GW <-- "TCP OUCH (127.0.0.1:40000, TCP_NODELAY)" --> EL
     GUI_OE <-- "TCP OUCH (127.0.0.1:40000)" --> EL
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B1PGM
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B2PGM
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B3PGM
+    PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> B4PGM
     PGM == "PGM ODATA / SPM / NCF / RDATA (239.255.0.1:30001)" ==> GUI_PGM
     B1PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
     B2PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
     B3PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
+    B4PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
     GUI_PGM -. "PGM NAK (127.0.0.1:30002)" .-> PGM
 ```
 
@@ -79,7 +92,7 @@ flowchart LR
 | `src/bot.rs` | Multi-threaded bot client (`spawn_bot`) with a dedicated PGM ITCH receiver thread (maintaining a local `ShadowBook` with microprice, multi-level Order Book Imbalance, EWMA volatility, and order-flow toxicity analytics), a TCP OUCH reader thread (tracking real-time inventory and mark-to-market PnL), a serialized TCP OUCH writer thread (`mpsc::Receiver<OuchInbound>`), and **2 concurrent strategy threads**. |
 | `src/bin/exchange.rs` | Standalone Exchange Server executable (`exchange`). |
 | `src/bin/bot.rs` | Standalone Trading Bot executable (`bot`). |
-| `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange and all three bots. |
+| `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange and all four bots. |
 | `src/bin/itch_client.rs` | Real-time **desktop GUI trading terminal** built with `eframe` / `egui` and `egui_plot`, featuring live price charts, L2 market depth ladder, interactive OUCH order submission/cancellation, order blotter with MTM PnL tracking, public Time & Sales tape, and a CLI fallback mode (`--cli`). |
 
 ---
@@ -106,7 +119,7 @@ The `itch_client` application provides an institutional-grade monitoring and tra
 5. **Time & Sales (Trade Tape)**:
    - Full public market execution stream showing timestamp, sequence number, order reference, side, shares, and execution price.
 6. **1-Click Built-in Simulator**:
-   - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 3 trading bots and auto-connect OUCH with zero configuration.
+   - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 4 trading bots and auto-connect OUCH with zero configuration.
 7. **🤖 Bot PnL Leaderboard & Equal Starting Capital (`$100,000.00`)**:
    - Every bot is initialized with an equal, fixed **`$100,000.00`** starting capital (`INITIAL_BOT_CAPITAL_DOLLARS = 100_000`), enforced by the bot's OUCH order gateway so no bot can buy or short beyond its available capital/equity.
    - Live ranking of the built-in bots by mark-to-market PnL, showing **Start Cap (`$100,000.00`)**, **Current Equity**, **MTM PnL**, **Available Cash**, **Position**, **Fills**, and **Orders**, plus a PnL-over-time chart per bot.
@@ -125,6 +138,9 @@ The `itch_client` application provides an institutional-grade monitoring and tra
 3. **Bot 3 — Smart Quantitative Bot (`--id 3`)**:
    * **Avellaneda-Stoikov Adaptive Market Maker (`AvellanedaStoikovMM`)**: Computes a continuous reservation price $r(s, q) = s_{\text{fair}} - q \cdot \gamma \cdot \sigma$ around the composite microstructure fair value, dynamically scales half-spreads with EWMA realized volatility $\sigma$ and order-flow toxicity, applies asymmetric adverse-selection protection against informed flow, preserves queue priority when quotes are within tolerance, and enforces hard inventory caps.
    * **Microprice & Order-Book Imbalance Alpha (`MicropriceImbalanceAlpha`)**: Combines volume-weighted top-of-book microprice, 5-level exponentially weighted Order Book Imbalance (OBI), and EWMA signed trade flow to snipe mispriced top-of-book liquidity or passively peg/improve the BBO to unwind inventory.
+4. **Bot 4 — Online Reinforcement Learning Bot (`--id 4`)**:
+   * **Tabular Q-Learning Market Maker (`TabularQLearningMM`)**: Encodes the market into 45 discrete states ($5\text{ inventory buckets} \times 3\text{ OBI regimes} \times 3\text{ volatility/toxicity regimes}$) and selects among 6 quoting actions (tight/moderate/wide symmetric, bid-skewed, ask-skewed, or inventory-flattening peg) using decaying $\epsilon$-greedy exploration and online Bellman TD(0) updates driven by inventory-penalized mark-to-market PnL rewards.
+   * **Contextual UCB1 Execution Bandit (`ContextualBanditTaker`)**: Partitions order-book imbalance and order-flow toxicity into 9 discrete contexts and learns online across 4 execution arms (`Hold`, `Snipe Ask`, `Hit Bid`, `Passive BBO Peg`) using Upper Confidence Bound (UCB1) exploration with recency-weighted reward updates.
 
 ---
 
@@ -183,4 +199,9 @@ cargo run --release --bin bot -- --id 2 --duration-ms 5000
 **Terminal 5 — Start Bot 3 (Smart Avellaneda-Stoikov MM + Microprice/OBI Alpha):**
 ```bash
 cargo run --release --bin bot -- --id 3 --duration-ms 5000
+```
+
+**Terminal 6 — Start Bot 4 (Reinforcement Learning Tabular Q-Learning MM + Contextual UCB1 Bandit):**
+```bash
+cargo run --release --bin bot -- --id 4 --duration-ms 5000
 ```
