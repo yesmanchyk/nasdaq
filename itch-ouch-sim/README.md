@@ -107,8 +107,9 @@ The `itch_client` application provides an institutional-grade monitoring and tra
    - Full public market execution stream showing timestamp, sequence number, order reference, side, shares, and execution price.
 6. **1-Click Built-in Simulator**:
    - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 3 trading bots and auto-connect OUCH with zero configuration.
-7. **🤖 Bot PnL Leaderboard**:
-   - Live ranking of the built-in bots by mark-to-market PnL, with position, cash, mark price, fills and order counts, plus a PnL-over-time chart per bot.
+7. **🤖 Bot PnL Leaderboard & Equal Starting Capital (`$100,000.00`)**:
+   - Every bot is initialized with an equal, fixed **`$100,000.00`** starting capital (`INITIAL_BOT_CAPITAL_DOLLARS = 100_000`), enforced by the bot's OUCH order gateway so no bot can buy or short beyond its available capital/equity.
+   - Live ranking of the built-in bots by mark-to-market PnL, showing **Start Cap (`$100,000.00`)**, **Current Equity**, **MTM PnL**, **Available Cash**, **Position**, **Fills**, and **Orders**, plus a PnL-over-time chart per bot.
    - When the built-in sim is stopped, the tab opens automatically and keeps showing each bot's final result.
 
 ---

@@ -266,12 +266,19 @@ impl ShadowBook {
     }
 }
 
+/// Equal, fixed starting capital allocated to every bot ($100,000.00)
+pub const INITIAL_BOT_CAPITAL_DOLLARS: u64 = 100_000;
+/// Equal, fixed starting capital in fixed-point units (1/10_000 of a dollar)
+pub const INITIAL_BOT_CAPITAL_FP: i64 = (INITIAL_BOT_CAPITAL_DOLLARS * PRICE_SCALE) as i64;
+
 /// Point-in-time PnL snapshot of a bot (all monetary values in fixed-point 1/10_000 dollars)
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BotPnl {
+    pub initial_capital_fp: i64,
     pub position: i64,
     pub cash_fp: i64,
     pub mark_fp: u64,
+    pub equity_fp: i64,
     pub mtm_pnl_fp: i64,
     pub fills: u64,
     pub acks: u64,
@@ -282,8 +289,10 @@ pub struct BotPnl {
 pub struct BotState {
     pub name: String,
     pub book: RwLock<ShadowBook>,
+    /// Fixed starting capital in fixed-point units (1/10_000 of a dollar)
+    pub initial_capital_fp: i64,
     pub position: AtomicI64,
-    /// Cash in fixed-point units (1/10_000 of a dollar)
+    /// Available cash balance in fixed-point units (1/10_000 of a dollar)
     pub cash_fp: AtomicI64,
     pub fills_count: AtomicU64,
     pub acks_count: AtomicU64,
@@ -293,11 +302,20 @@ pub struct BotState {
 
 impl BotState {
     pub fn new(name: impl Into<String>, bot_id_prefix: u64) -> Self {
+        Self::with_capital(name, bot_id_prefix, INITIAL_BOT_CAPITAL_FP)
+    }
+
+    pub fn with_capital(
+        name: impl Into<String>,
+        bot_id_prefix: u64,
+        initial_capital_fp: i64,
+    ) -> Self {
         Self {
             name: name.into(),
             book: RwLock::new(ShadowBook::default()),
+            initial_capital_fp,
             position: AtomicI64::new(0),
-            cash_fp: AtomicI64::new(0),
+            cash_fp: AtomicI64::new(initial_capital_fp),
             fills_count: AtomicU64::new(0),
             acks_count: AtomicU64::new(0),
             cancels_count: AtomicU64::new(0),
@@ -309,16 +327,45 @@ impl BotState {
         self.next_cl_ord_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Clamps requested order size to what the bot can afford within its fixed capital budget (1x equity).
+    pub fn affordable_shares(&self, side: Side, requested_shares: u32, price: u64) -> u32 {
+        if price == 0 || requested_shares == 0 {
+            return 0;
+        }
+        let px = price as i64;
+        let cash = self.cash_fp.load(Ordering::Relaxed);
+        let pos = self.position.load(Ordering::Relaxed);
+        let equity_fp = (cash + pos * px).max(0);
+        let max_exposure_shares = equity_fp / px;
+
+        match side {
+            Side::Buy => {
+                let max_by_cash = (cash.max(0) / px).max(0);
+                let max_by_equity = (max_exposure_shares - pos).max(0);
+                let max_sh = max_by_cash.min(max_by_equity) as u32;
+                requested_shares.min(max_sh)
+            }
+            Side::Sell => {
+                let max_by_equity = (max_exposure_shares + pos).max(0) as u32;
+                requested_shares.min(max_by_equity)
+            }
+        }
+    }
+
     /// Point-in-time PnL / activity snapshot, marked to the bot's own shadow-book mid price.
     pub fn pnl_snapshot(&self) -> BotPnl {
         let mark_fp = self.book.read().unwrap().mid_price();
         let position = self.position.load(Ordering::Relaxed);
         let cash_fp = self.cash_fp.load(Ordering::Relaxed);
+        let equity_fp = cash_fp + position * (mark_fp as i64);
+        let mtm_pnl_fp = equity_fp - self.initial_capital_fp;
         BotPnl {
+            initial_capital_fp: self.initial_capital_fp,
             position,
             cash_fp,
             mark_fp,
-            mtm_pnl_fp: cash_fp + position * (mark_fp as i64),
+            equity_fp,
+            mtm_pnl_fp,
             fills: self.fills_count.load(Ordering::Relaxed),
             acks: self.acks_count.load(Ordering::Relaxed),
             cancels: self.cancels_count.load(Ordering::Relaxed),
@@ -330,11 +377,13 @@ impl BotState {
         let mid = book.mid_price();
         let pos = self.position.load(Ordering::Relaxed);
         let cash = self.cash_fp.load(Ordering::Relaxed);
-        let mtm_pnl = cash + pos * (mid as i64);
+        let equity_fp = cash + pos * (mid as i64);
+        let mtm_pnl = equity_fp - self.initial_capital_fp;
+        let equity_dollars = equity_fp as f64 / (PRICE_SCALE as f64);
         let pnl_dollars = mtm_pnl as f64 / (PRICE_SCALE as f64);
 
         format!(
-            "[{}] PGM_ITCH: {:4} (RDATA:{}/NAK:{}) | Acks: {:4} | Cancels: {:4} | Fills: {:4} | Pos: {:+5} sh | MTM PnL: ${:+9.2}",
+            "[{}] PGM_ITCH: {:4} (RDATA:{}/NAK:{}) | Acks: {:4} | Cancels: {:4} | Fills: {:4} | Pos: {:+5} sh | Equity: ${:10.2} | MTM PnL: ${:+9.2}",
             self.name,
             book.itch_packets,
             book.pgm_rdata_recovered,
@@ -343,6 +392,7 @@ impl BotState {
             self.cancels_count.load(Ordering::Relaxed),
             self.fills_count.load(Ordering::Relaxed),
             pos,
+            equity_dollars,
             pnl_dollars
         )
     }
@@ -527,13 +577,35 @@ pub fn spawn_bot(
         }));
     }
 
-    // 3. TCP OUCH Order Gateway Writer Thread (serializes orders from concurrent strategies)
+    // 3. TCP OUCH Order Gateway Writer Thread (serializes orders from concurrent strategies
+    //    and enforces the bot's fixed starting capital / buying-power budget)
     {
+        let state = Arc::clone(&state);
         let running = Arc::clone(&running);
         threads.push(thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
                 match ouch_rx.recv_timeout(Duration::from_millis(5)) {
                     Ok(cmd) => {
+                        let cmd = match cmd {
+                            OuchInbound::EnterOrder {
+                                cl_ord_id,
+                                side,
+                                shares,
+                                price,
+                            } => {
+                                let allowed = state.affordable_shares(side, shares, price);
+                                if allowed == 0 {
+                                    continue;
+                                }
+                                OuchInbound::EnterOrder {
+                                    cl_ord_id,
+                                    side,
+                                    shares: allowed,
+                                    price,
+                                }
+                            }
+                            other => other,
+                        };
                         let bytes = cmd.to_bytes();
                         if write_frame(&mut ouch_writer, &bytes).is_err() {
                             break;
@@ -617,6 +689,10 @@ fn run_strategy(
                 fair_value,
                 threshold,
             } => {
+                for old_id in active_orders.drain(..) {
+                    let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                }
+
                 let (best_bid, best_ask) = {
                     let b = state.book.read().unwrap();
                     (b.best_bid(), b.best_ask())
@@ -625,27 +701,35 @@ fn run_strategy(
                 if let Some((ask_px, _)) = best_ask
                     && ask_px + threshold < fair_value
                 {
+                    let id = state.next_id();
                     let _ = tx.send(OuchInbound::EnterOrder {
-                        cl_ord_id: state.next_id(),
+                        cl_ord_id: id,
                         side: Side::Buy,
                         shares: 50,
                         price: ask_px,
                     });
+                    active_orders.push(id);
                 } else if let Some((bid_px, _)) = best_bid
                     && bid_px > fair_value + threshold
                 {
+                    let id = state.next_id();
                     let _ = tx.send(OuchInbound::EnterOrder {
-                        cl_ord_id: state.next_id(),
+                        cl_ord_id: id,
                         side: Side::Sell,
                         shares: 50,
                         price: bid_px,
                     });
+                    active_orders.push(id);
                 }
 
                 thread::sleep(Duration::from_millis(6));
             }
 
             StrategyKind::MomentumSniper { lot_size } => {
+                for old_id in active_orders.drain(..) {
+                    let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                }
+
                 let (buy_vol, sell_vol, best_bid, best_ask) = {
                     let b = state.book.read().unwrap();
                     (
@@ -659,37 +743,46 @@ fn run_strategy(
                 if buy_vol >= sell_vol
                     && let Some((ask_px, _)) = best_ask
                 {
+                    let id = state.next_id();
                     let _ = tx.send(OuchInbound::EnterOrder {
-                        cl_ord_id: state.next_id(),
+                        cl_ord_id: id,
                         side: Side::Buy,
                         shares: lot_size,
                         price: ask_px + 10,
                     });
+                    active_orders.push(id);
                 } else if let Some((bid_px, _)) = best_bid {
+                    let id = state.next_id();
                     let _ = tx.send(OuchInbound::EnterOrder {
-                        cl_ord_id: state.next_id(),
+                        cl_ord_id: id,
                         side: Side::Sell,
                         shares: lot_size,
                         price: bid_px.saturating_sub(10),
                     });
+                    active_orders.push(id);
                 }
 
                 thread::sleep(Duration::from_millis(7));
             }
 
             StrategyKind::LiquidityTaker { lot_size } => {
+                for old_id in active_orders.drain(..) {
+                    let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
+                }
+
                 let (best_bid, best_ask) = {
                     let b = state.book.read().unwrap();
                     (b.best_bid(), b.best_ask())
                 };
                 // Alternate aggressive buy/sell pings to create realistic tape flow
                 let wobble = ((tick + strat_idx as u64) % 5) * 15;
+                let id = state.next_id();
                 if tick.is_multiple_of(2) {
                     let px = best_ask
                         .map(|(a, _)| a + wobble)
                         .unwrap_or(100 * PRICE_SCALE + 25);
                     let _ = tx.send(OuchInbound::EnterOrder {
-                        cl_ord_id: state.next_id(),
+                        cl_ord_id: id,
                         side: Side::Buy,
                         shares: lot_size,
                         price: px,
@@ -699,12 +792,13 @@ fn run_strategy(
                         .map(|(b, _)| b.saturating_sub(wobble))
                         .unwrap_or(100 * PRICE_SCALE - 25);
                     let _ = tx.send(OuchInbound::EnterOrder {
-                        cl_ord_id: state.next_id(),
+                        cl_ord_id: id,
                         side: Side::Sell,
                         shares: lot_size,
                         price: px,
                     });
                 }
+                active_orders.push(id);
 
                 thread::sleep(Duration::from_millis(5));
             }
@@ -1001,6 +1095,37 @@ mod tests {
             strats[1],
             StrategyKind::MicropriceImbalanceAlpha { .. }
         ));
+    }
+
+    #[test]
+    fn test_equal_fixed_starting_capital_and_buying_power() {
+        let bot1 = BotState::new("Bot-1", 1);
+        let bot2 = BotState::new("Bot-2", 2);
+        let bot3 = BotState::new("Bot-3", 3);
+
+        // All bots start with the exact same fixed capital ($100,000.00) and $0.00 net PnL
+        assert_eq!(bot1.initial_capital_fp, INITIAL_BOT_CAPITAL_FP);
+        assert_eq!(bot1.initial_capital_fp, bot2.initial_capital_fp);
+        assert_eq!(bot2.initial_capital_fp, bot3.initial_capital_fp);
+
+        let snap = bot1.pnl_snapshot();
+        assert_eq!(snap.cash_fp, INITIAL_BOT_CAPITAL_FP);
+        assert_eq!(snap.equity_fp, INITIAL_BOT_CAPITAL_FP);
+        assert_eq!(snap.mtm_pnl_fp, 0);
+
+        // At $100.0000 per share (1_000_000 fp), $100,000.00 can buy at most 1,000 shares
+        assert_eq!(
+            bot1.affordable_shares(Side::Buy, 2_500, 100 * PRICE_SCALE),
+            1_000
+        );
+
+        // If all cash is spent, further buy orders are clamped to 0 shares
+        bot1.cash_fp.store(0, Ordering::Relaxed);
+        bot1.position.store(1_000, Ordering::Relaxed);
+        assert_eq!(
+            bot1.affordable_shares(Side::Buy, 100, 100 * PRICE_SCALE),
+            0
+        );
     }
 }
 

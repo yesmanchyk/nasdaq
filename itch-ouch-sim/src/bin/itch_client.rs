@@ -578,6 +578,11 @@ impl ItchGuiApp {
         rows.sort_by(|a, b| b.2.mtm_pnl_fp.cmp(&a.2.mtm_pnl_fp));
         let total_fp: i64 = rows.iter().map(|r| r.2.mtm_pnl_fp).sum();
 
+        let init_cap_dollars = rows
+            .first()
+            .map(|r| r.2.initial_capital_fp as f64 / PRICE_SCALE as f64)
+            .unwrap_or(itch_ouch_sim::bot::INITIAL_BOT_CAPITAL_DOLLARS as f64);
+
         ui.columns(2, |cols| {
             // ---- Left: Leaderboard table ----
             let ui = &mut cols[0];
@@ -585,7 +590,7 @@ impl ItchGuiApp {
                 ui.label(status);
                 ui.label(
                     RichText::new(format!(
-                        "| Net of all bots: ${:+.2}",
+                        "| Equal Starting Capital: ${init_cap_dollars:.2} each | Net Bot PnL: ${:+.2}",
                         total_fp as f64 / PRICE_SCALE as f64
                     ))
                     .small()
@@ -595,15 +600,27 @@ impl ItchGuiApp {
             ui.add_space(4.0);
             egui::Grid::new("bot_pnl_grid")
                 .striped(true)
-                .spacing([14.0, 4.0])
+                .spacing([12.0, 4.0])
                 .show(ui, |ui| {
-                    for h in ["#", "BOT", "MTM PnL", "POSITION", "CASH", "MARK", "FILLS", "ORDERS"] {
+                    for h in [
+                        "#",
+                        "BOT",
+                        "START CAP",
+                        "EQUITY",
+                        "MTM PnL",
+                        "CASH",
+                        "POSITION",
+                        "FILLS",
+                        "ORDERS",
+                    ] {
                         ui.label(RichText::new(h).small().color(muted));
                     }
                     ui.end_row();
 
                     for (rank, (idx, bot, p)) in rows.iter().enumerate() {
                         let color = BOT_COLORS[*idx % BOT_COLORS.len()];
+                        let start_cap = p.initial_capital_fp as f64 / PRICE_SCALE as f64;
+                        let equity = p.equity_fp as f64 / PRICE_SCALE as f64;
                         let pnl = p.mtm_pnl_fp as f64 / PRICE_SCALE as f64;
                         let pnl_col = if pnl > 0.0 {
                             green
@@ -621,25 +638,31 @@ impl ItchGuiApp {
                         ui.label(RichText::new(format!("{medal}{}", rank + 1)).strong());
                         ui.label(RichText::new(bot.state.name.trim()).strong().color(color));
                         ui.label(
+                            RichText::new(format!("${start_cap:.2}"))
+                                .monospace()
+                                .color(muted),
+                        );
+                        ui.label(
+                            RichText::new(format!("${equity:.2}"))
+                                .monospace()
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
                             RichText::new(format!("${pnl:+.2}"))
                                 .monospace()
                                 .strong()
                                 .color(pnl_col),
                         );
-                        ui.label(RichText::new(format!("{:+} sh", p.position)).monospace());
                         ui.label(
                             RichText::new(format!(
-                                "${:+.2}",
+                                "${:.2}",
                                 p.cash_fp as f64 / PRICE_SCALE as f64
                             ))
                             .monospace()
                             .color(muted),
                         );
-                        ui.label(
-                            RichText::new(format!("${}", fmt_price(p.mark_fp)))
-                                .monospace()
-                                .color(muted),
-                        );
+                        ui.label(RichText::new(format!("{:+} sh", p.position)).monospace());
                         ui.label(RichText::new(format!("{}", p.fills)).monospace());
                         ui.label(
                             RichText::new(format!("{} / {}x", p.acks, p.cancels))
@@ -651,9 +674,11 @@ impl ItchGuiApp {
                 });
             ui.add_space(4.0);
             ui.label(
-                RichText::new("MTM PnL = cash + position × mid price (marked to each bot's shadow book).")
-                    .small()
-                    .color(muted),
+                RichText::new(
+                    "Each bot starts with an equal, fixed $100,000.00 capital budget. Equity = Cash + Position × Mid; MTM PnL = Equity − Start Cap.",
+                )
+                .small()
+                .color(muted),
             );
 
             // ---- Right: PnL over time chart ----
