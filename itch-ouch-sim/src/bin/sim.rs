@@ -4,7 +4,7 @@
 //! connected via TCP OUCH (`127.0.0.1:40000`) and PGM Reliable Multicast ITCH
 //! (`239.255.0.1:30001`, NAK repair on `127.0.0.1:30002`).
 
-use itch_ouch_sim::bot::{default_strategies_for_bot, spawn_bot};
+use itch_ouch_sim::bot::{BotRunPerformance, append_run_history, default_strategies_for_bot, spawn_bot};
 use itch_ouch_sim::exchange::ExchangeServer;
 use itch_ouch_sim::pgm::{
     DEFAULT_MCAST_GROUP, DEFAULT_MCAST_PORT, DEFAULT_NAK_ADDR, DEFAULT_OUCH_ADDR,
@@ -120,11 +120,41 @@ fn main() -> std::io::Result<()> {
     let bot2_final = bot2.state.summary();
     let bot3_final = bot3.state.summary();
     let bot4_final = bot4.state.summary();
+
+    let bot_perf_records = vec![
+        BotRunPerformance {
+            bot_id: 1,
+            name: bot1.state.name.clone(),
+            pnl: bot1.state.pnl_snapshot(),
+        },
+        BotRunPerformance {
+            bot_id: 2,
+            name: bot2.state.name.clone(),
+            pnl: bot2.state.pnl_snapshot(),
+        },
+        BotRunPerformance {
+            bot_id: 3,
+            name: bot3.state.name.clone(),
+            pnl: bot3.state.pnl_snapshot(),
+        },
+        BotRunPerformance {
+            bot_id: 4,
+            name: bot4.state.name.clone(),
+            pnl: bot4.state.pnl_snapshot(),
+        },
+    ];
+
     bot1.join();
     bot2.join();
     bot3.join();
     bot4.join();
     let exchange = exchange_thread.join().unwrap();
+
+    let actual_duration_ms = start.elapsed().as_millis() as u64;
+    let history_note = match append_run_history("sim", actual_duration_ms, &bot_perf_records) {
+        Ok(path) => format!("Saved run performance history to {}", path.display()),
+        Err(e) => format!("Warning: failed to append run performance history: {e}"),
+    };
 
     println!("\n====================================================================================================");
     println!("  FINAL SIMULATION SUMMARY ({} ms)", duration_ms);
@@ -134,6 +164,7 @@ fn main() -> std::io::Result<()> {
     println!("Bot 2    : {}", bot2_final);
     println!("Bot 3    : {}", bot3_final);
     println!("Bot 4    : {}", bot4_final);
+    println!("History  : {}", history_note);
 
     Ok(())
 }

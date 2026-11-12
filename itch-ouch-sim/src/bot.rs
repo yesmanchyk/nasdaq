@@ -1362,6 +1362,97 @@ pub fn rl_weights_dir() -> PathBuf {
     }
 }
 
+/// Resolves the directory used to persist simulation run summaries and bot performance history.
+///
+/// Honors `ITCH_OUCH_SIM_HISTORY_DIR` if set; otherwise uses `itch-ouch-sim/sim_history`
+/// when invoked from the repository root or `sim_history` when invoked from `itch-ouch-sim/`.
+pub fn sim_history_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("ITCH_OUCH_SIM_HISTORY_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    if Path::new("itch-ouch-sim/Cargo.toml").exists() {
+        PathBuf::from("itch-ouch-sim/sim_history")
+    } else {
+        PathBuf::from("sim_history")
+    }
+}
+
+/// Performance record for a single bot at the end of a simulation run.
+#[derive(Clone, Debug)]
+pub struct BotRunPerformance {
+    pub bot_id: u64,
+    pub name: String,
+    pub pnl: BotPnl,
+}
+
+/// Appends a structured summary of a simulation run to `sim_history/runs.csv`.
+///
+/// Records timestamp (ISO 8601-like UTC seconds), run duration, source, and per-bot
+/// financial performance (Initial Capital, Equity, MTM PnL, Cash, Position, Fills, Orders, RL Steps).
+pub fn append_run_history(
+    source: &str,
+    duration_ms: u64,
+    bots: &[BotRunPerformance],
+) -> std::io::Result<PathBuf> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::SystemTime;
+
+    let dir = sim_history_dir();
+    fs::create_dir_all(&dir)?;
+    let file_path = dir.join("runs.csv");
+    let is_new = !file_path.exists() || fs::metadata(&file_path)?.len() == 0;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)?;
+
+    if is_new {
+        writeln!(
+            file,
+            "timestamp_unix_s,source,duration_ms,bot_id,bot_name,start_cap_dollars,equity_dollars,mtm_pnl_dollars,cash_dollars,position_shares,fills,acks,cancels,rl_q_updates,rl_bandit_updates"
+        )?;
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for b in bots {
+        let p = &b.pnl;
+        let start_cap = p.initial_capital_fp as f64 / (PRICE_SCALE as f64);
+        let equity = p.equity_fp as f64 / (PRICE_SCALE as f64);
+        let pnl = p.mtm_pnl_fp as f64 / (PRICE_SCALE as f64);
+        let cash = p.cash_fp as f64 / (PRICE_SCALE as f64);
+        writeln!(
+            file,
+            "{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{}",
+            ts,
+            source,
+            duration_ms,
+            b.bot_id,
+            b.name.trim(),
+            start_cap,
+            equity,
+            pnl,
+            cash,
+            p.position,
+            p.fills,
+            p.acks,
+            p.cancels,
+            p.rl_q_updates,
+            p.rl_bandit_updates
+        )?;
+    }
+    file.flush()?;
+
+    Ok(file_path)
+}
+
 /// Atomically writes `content` to `path` via a sibling temporary file + `fs::rename`.
 fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
@@ -1995,6 +2086,55 @@ mod tests {
         assert_eq!(loaded_b.context_visits[ctx], bandit.context_visits[ctx]);
         assert!((loaded_b.mean_reward[ctx][2] - bandit.mean_reward[ctx][2]).abs() < 1e-6);
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_append_run_history() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "itch_ouch_history_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let orig_env = std::env::var("ITCH_OUCH_SIM_HISTORY_DIR").ok();
+        unsafe {
+            std::env::set_var("ITCH_OUCH_SIM_HISTORY_DIR", &tmp_dir);
+        }
+
+        let bot1 = BotState::new("Bot-1", 1);
+        let bot2 = BotState::new("Bot-2", 2);
+        bot1.position.store(150, Ordering::Relaxed);
+        bot2.fills_count.store(42, Ordering::Relaxed);
+
+        let records = vec![
+            BotRunPerformance {
+                bot_id: 1,
+                name: bot1.name.clone(),
+                pnl: bot1.pnl_snapshot(),
+            },
+            BotRunPerformance {
+                bot_id: 2,
+                name: bot2.name.clone(),
+                pnl: bot2.pnl_snapshot(),
+            },
+        ];
+
+        let history_file = append_run_history("test", 1_500, &records).expect("append history");
+        assert!(history_file.exists());
+        let content = fs::read_to_string(&history_file).expect("read history");
+        assert!(content.contains("timestamp_unix_s,source,duration_ms"));
+        assert!(content.contains("Bot-1"));
+        assert!(content.contains("Bot-2"));
+
+        if let Some(v) = orig_env {
+            unsafe {
+                std::env::set_var("ITCH_OUCH_SIM_HISTORY_DIR", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("ITCH_OUCH_SIM_HISTORY_DIR");
+            }
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

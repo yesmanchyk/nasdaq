@@ -1,0 +1,5 @@
+timestamp_unix_s,source,duration_ms,bot_id,bot_name,start_cap_dollars,equity_dollars,mtm_pnl_dollars,cash_dollars,position_shares,fills,acks,cancels,rl_q_updates,rl_bandit_updates
+1794487225,sim,804,1,Bot-1 (MM + MeanRev),100000.00,99915.66,-84.34,150359.46,-504,271,427,389,0,0
+1794487225,sim,804,2,Bot-2 (Mom + Taker),100000.00,100187.63,187.63,0.64,1001,321,26,8,0,0
+1794487225,sim,804,3,Bot-3 (Smart AS+OBI),100000.00,99982.34,-17.66,107989.29,-80,121,579,527,0,0
+1794487225,sim,804,4,Bot-4 (RL Q+Bandit),100000.00,99914.37,-85.63,141650.61,-417,197,396,341,579,467

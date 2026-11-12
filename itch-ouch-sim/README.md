@@ -120,9 +120,10 @@ The `itch_client` application provides an institutional-grade monitoring and tra
    - Full public market execution stream showing timestamp, sequence number, order reference, side, shares, and execution price.
 6. **1-Click Built-in Simulator**:
    - Includes a **`▶ Start Built-in Sim`** button in the header to launch an embedded exchange + 4 trading bots and auto-connect OUCH with zero configuration.
-7. **🤖 Bot PnL Leaderboard & Equal Starting Capital (`$100,000.00`)**:
+7. **🤖 Bot PnL Leaderboard, Equal Starting Capital (`$100,000.00`) & Run History**:
    - Every bot is initialized with an equal, fixed **`$100,000.00`** starting capital (`INITIAL_BOT_CAPITAL_DOLLARS = 100_000`), enforced by the bot's OUCH order gateway so no bot can buy or short beyond its available capital/equity.
-   - Live ranking of the built-in bots by mark-to-market PnL, showing **Start Cap (`$100,000.00`)**, **Current Equity**, **MTM PnL**, **Available Cash**, **Position**, **Fills**, and **Orders**, plus a PnL-over-time chart per bot.
+   - Live ranking of the built-in bots by mark-to-market PnL, showing **Start Cap (`$100,000.00`)**, **Current Equity**, **MTM PnL**, **Available Cash**, **Position**, **Fills**, **Orders**, and cumulative **RL Steps**, plus a PnL-over-time chart per bot.
+   - **Persistent Performance History (`sim_history/runs.csv`)**: Every simulation run (both headless `sim` and desktop GUI built-in sim) automatically appends each bot's final PnL, equity, cash, inventory, fills, and RL steps to `sim_history/runs.csv` for historical tracking across runs (configurable via `ITCH_OUCH_SIM_HISTORY_DIR`).
    - When the built-in sim is stopped, the tab opens automatically and keeps showing each bot's final result.
 
 ---

@@ -445,8 +445,26 @@ impl ItchGuiApp {
             flag.store(false, Ordering::Relaxed);
             // Take one last PnL sample so the final result is on the chart
             self.sample_bot_pnl(true);
-            self.sim_stopped_after_s = self.sim_started_at.map(|t| t.elapsed().as_secs_f64());
-            self.status_msg = "Stopped built-in simulation — final bot PnL in 🤖 BOT PnL tab".to_string();
+            let stopped_s = self.sim_started_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            self.sim_stopped_after_s = Some(stopped_s);
+
+            let perf_records: Vec<itch_ouch_sim::bot::BotRunPerformance> = self
+                .sim_bots
+                .iter()
+                .enumerate()
+                .map(|(idx, b)| itch_ouch_sim::bot::BotRunPerformance {
+                    bot_id: (idx + 1) as u64,
+                    name: b.state.name.clone(),
+                    pnl: b.state.pnl_snapshot(),
+                })
+                .collect();
+            let duration_ms = (stopped_s * 1000.0).round() as u64;
+            let hist_suffix = match itch_ouch_sim::bot::append_run_history("gui_builtin", duration_ms, &perf_records) {
+                Ok(p) => format!(" — saved to {}", p.display()),
+                Err(_) => String::new(),
+            };
+
+            self.status_msg = format!("Stopped built-in simulation — final bot PnL in 🤖 BOT PnL tab{hist_suffix}");
             self.bottom_tab = BottomTab::BotPnl;
             return;
         }
