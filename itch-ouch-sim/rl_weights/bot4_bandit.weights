@@ -1,0 +1,11 @@
+# ITCH-OUCH-SIM ContextualBanditTaker Weights v1
+updates=312
+context 0 visits 27 counts 4 5 10 8 rewards -0.18869421 -0.13890257 -0.17905697 -0.15172877
+context 1 visits 26 counts 5 2 9 10 rewards -0.15717989 -0.29086075 -0.23981329 -0.14404507
+context 2 visits 44 counts 10 6 10 18 rewards -0.32852444 -0.35613752 -0.41219940 -0.25272859
+context 3 visits 58 counts 5 3 16 34 rewards -0.27371241 -0.20165700 -0.21390553 -0.14586801
+context 4 visits 46 counts 10 3 7 26 rewards -0.29454088 -0.33595514 -0.38465454 -0.29280663
+context 5 visits 84 counts 9 14 12 49 rewards -0.64068043 -0.66335398 -0.74714378 -0.60721942
+context 6 visits 19 counts 6 2 4 7 rewards -0.05975242 -0.17383075 -0.18810907 -0.03620931
+context 7 visits 17 counts 4 7 2 4 rewards 0.06994292 -0.03724297 -0.16204300 0.04447632
+context 8 visits 27 counts 6 12 4 5 rewards -0.36562940 -0.20649792 -0.34186108 -0.53098710

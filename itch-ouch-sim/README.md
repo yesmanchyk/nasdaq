@@ -141,6 +141,7 @@ The `itch_client` application provides an institutional-grade monitoring and tra
 4. **Bot 4 — Online Reinforcement Learning Bot (`--id 4`)**:
    * **Tabular Q-Learning Market Maker (`TabularQLearningMM`)**: Encodes the market into 45 discrete states ($5\text{ inventory buckets} \times 3\text{ OBI regimes} \times 3\text{ volatility/toxicity regimes}$) and selects among 6 quoting actions (tight/moderate/wide symmetric, bid-skewed, ask-skewed, or inventory-flattening peg) using decaying $\epsilon$-greedy exploration and online Bellman TD(0) updates driven by inventory-penalized mark-to-market PnL rewards.
    * **Contextual UCB1 Execution Bandit (`ContextualBanditTaker`)**: Partitions order-book imbalance and order-flow toxicity into 9 discrete contexts and learns online across 4 execution arms (`Hold`, `Snipe Ask`, `Hit Bid`, `Passive BBO Peg`) using Upper Confidence Bound (UCB1) exploration with recency-weighted reward updates.
+   * **Cross-Run Weight Persistence (`rl_weights/`)**: Learned Q-table values (`rl_weights/bot4_q_table.weights`) and Contextual Bandit arm rewards/counts (`rl_weights/bot4_bandit.weights`) are automatically loaded on bot startup, periodically checkpointed via atomic file renames during execution, and flushed on shutdown so Bot 4 accumulates experience across simulation runs (configurable via `ITCH_OUCH_RL_WEIGHTS_DIR`).
 
 ---
 

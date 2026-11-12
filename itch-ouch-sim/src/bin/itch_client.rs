@@ -613,6 +613,7 @@ impl ItchGuiApp {
                         "POSITION",
                         "FILLS",
                         "ORDERS",
+                        "RL STEPS",
                     ] {
                         ui.label(RichText::new(h).small().color(muted));
                     }
@@ -670,6 +671,12 @@ impl ItchGuiApp {
                                 .monospace()
                                 .color(muted),
                         );
+                        let rl_label = if p.rl_q_updates > 0 || p.rl_bandit_updates > 0 {
+                            format!("Q:{} B:{}", p.rl_q_updates, p.rl_bandit_updates)
+                        } else {
+                            "—".to_string()
+                        };
+                        ui.label(RichText::new(rl_label).monospace().color(muted));
                         ui.end_row();
                     }
                 });

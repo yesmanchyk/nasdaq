@@ -18,7 +18,10 @@ use crate::protocol::{
     write_frame,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -283,6 +286,8 @@ pub struct BotPnl {
     pub fills: u64,
     pub acks: u64,
     pub cancels: u64,
+    pub rl_q_updates: u64,
+    pub rl_bandit_updates: u64,
 }
 
 /// Shared bot telemetry & position tracking across its concurrent strategies
@@ -297,6 +302,8 @@ pub struct BotState {
     pub fills_count: AtomicU64,
     pub acks_count: AtomicU64,
     pub cancels_count: AtomicU64,
+    pub rl_q_updates: AtomicU64,
+    pub rl_bandit_updates: AtomicU64,
     next_cl_ord_id: AtomicU64,
 }
 
@@ -319,6 +326,8 @@ impl BotState {
             fills_count: AtomicU64::new(0),
             acks_count: AtomicU64::new(0),
             cancels_count: AtomicU64::new(0),
+            rl_q_updates: AtomicU64::new(0),
+            rl_bandit_updates: AtomicU64::new(0),
             next_cl_ord_id: AtomicU64::new(bot_id_prefix * 1_000_000 + 1),
         }
     }
@@ -369,6 +378,8 @@ impl BotState {
             fills: self.fills_count.load(Ordering::Relaxed),
             acks: self.acks_count.load(Ordering::Relaxed),
             cancels: self.cancels_count.load(Ordering::Relaxed),
+            rl_q_updates: self.rl_q_updates.load(Ordering::Relaxed),
+            rl_bandit_updates: self.rl_bandit_updates.load(Ordering::Relaxed),
         }
     }
 
@@ -381,9 +392,16 @@ impl BotState {
         let mtm_pnl = equity_fp - self.initial_capital_fp;
         let equity_dollars = equity_fp as f64 / (PRICE_SCALE as f64);
         let pnl_dollars = mtm_pnl as f64 / (PRICE_SCALE as f64);
+        let rl_q = self.rl_q_updates.load(Ordering::Relaxed);
+        let rl_b = self.rl_bandit_updates.load(Ordering::Relaxed);
+        let rl_suffix = if rl_q > 0 || rl_b > 0 {
+            format!(" | RL_Steps[Q:{rl_q} B:{rl_b}]")
+        } else {
+            String::new()
+        };
 
         format!(
-            "[{}] PGM_ITCH: {:4} (RDATA:{}/NAK:{}) | Acks: {:4} | Cancels: {:4} | Fills: {:4} | Pos: {:+5} sh | Equity: ${:10.2} | MTM PnL: ${:+9.2}",
+            "[{}] PGM_ITCH: {:4} (RDATA:{}/NAK:{}) | Acks: {:4} | Cancels: {:4} | Fills: {:4} | Pos: {:+5} sh | Equity: ${:10.2} | MTM PnL: ${:+9.2}{}",
             self.name,
             book.itch_packets,
             book.pgm_rdata_recovered,
@@ -393,7 +411,8 @@ impl BotState {
             self.fills_count.load(Ordering::Relaxed),
             pos,
             equity_dollars,
-            pnl_dollars
+            pnl_dollars,
+            rl_suffix
         )
     }
 }
@@ -1073,8 +1092,13 @@ fn run_strategy(
                 learning_rate_bps,
                 discount_bps,
             } => {
-                // Lazy-init local Q-learning state on tick == 1 across loop iterations
-                let q_agent = q_learner.get_or_insert_with(QLearningTable::new_with_priors);
+                // Lazy-init Q-learning table by loading persisted weights from disk (or priors on first run)
+                let q_agent = q_learner.get_or_insert_with(|| {
+                    let path = QLearningTable::default_weights_path();
+                    let table = QLearningTable::load_or_init(&path);
+                    state.rl_q_updates.store(table.updates, Ordering::Relaxed);
+                    table
+                });
                 let alpha = (learning_rate_bps as f64 / 10_000.0).clamp(0.01, 0.99);
                 let gamma = (discount_bps as f64 / 10_000.0).clamp(0.0, 0.999);
 
@@ -1101,10 +1125,15 @@ fn run_strategy(
                     let inv_norm = (pos as f64) / 150.0;
                     let reward = delta_pnl_dollars - 0.08 * (inv_norm * inv_norm);
                     q_agent.update(prev_state, prev_action, reward, cur_state, alpha, gamma);
+                    state.rl_q_updates.store(q_agent.updates, Ordering::Relaxed);
+                    // Periodically checkpoint weights to disk so progress is preserved even on abrupt stop
+                    if q_agent.updates.is_multiple_of(25) {
+                        let _ = q_agent.save_to_file(&QLearningTable::default_weights_path());
+                    }
                 }
 
-                // Decaying epsilon-greedy exploration (starts at 18%, decays toward 3%)
-                let epsilon = (0.18 / (1.0 + (tick as f64) * 0.015)).max(0.03);
+                // Decaying epsilon-greedy exploration driven by cumulative persisted updates across runs
+                let epsilon = (0.18 / (1.0 + (q_agent.updates as f64) * 0.008)).max(0.03);
                 let action = q_agent.select_action(cur_state, epsilon, &mut rng_state);
                 prev_q_step = Some((cur_state, action, snap.mtm_pnl_fp));
 
@@ -1183,7 +1212,13 @@ fn run_strategy(
                     let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
                 }
 
-                let bandit = bandit_learner.get_or_insert_with(ContextualBandit::new_with_priors);
+                // Lazy-init Contextual Bandit by loading persisted weights from disk (or priors on first run)
+                let bandit = bandit_learner.get_or_insert_with(|| {
+                    let path = ContextualBandit::default_weights_path();
+                    let b = ContextualBandit::load_or_init(&path);
+                    state.rl_bandit_updates.store(b.updates, Ordering::Relaxed);
+                    b
+                });
                 let exploration_c = (exploration_bps as f64 / 10_000.0).max(0.01);
 
                 let (smart_fv, obi, toxicity, best_bid, best_ask) = {
@@ -1206,6 +1241,10 @@ fn run_strategy(
                     let inv_norm = (pos as f64) / 200.0;
                     let reward = delta_pnl_dollars - 0.05 * (inv_norm * inv_norm);
                     bandit.update(prev_ctx, prev_arm, reward);
+                    state.rl_bandit_updates.store(bandit.updates, Ordering::Relaxed);
+                    if bandit.updates.is_multiple_of(25) {
+                        let _ = bandit.save_to_file(&ContextualBandit::default_weights_path());
+                    }
                 }
 
                 let ctx = ContextualBandit::encode_context(obi, toxicity);
@@ -1289,12 +1328,52 @@ fn run_strategy(
         }
     }
 
+    // Flush latest learned RL weights to disk on clean strategy shutdown
+    if let Some(ref q_agent) = q_learner {
+        let _ = q_agent.save_to_file(&QLearningTable::default_weights_path());
+    }
+    if let Some(ref bandit) = bandit_learner {
+        let _ = bandit.save_to_file(&ContextualBandit::default_weights_path());
+    }
+
     let _ = fmt_price(0);
 }
 
 // ============================================================================
 // Online Reinforcement Learning Primitives (Tabular Q-Learning + Contextual UCB1)
 // ============================================================================
+
+static RL_TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Resolves the directory used to persist Bot 4's RL weights between simulation runs.
+///
+/// Honors `ITCH_OUCH_RL_WEIGHTS_DIR` if set; otherwise uses `itch-ouch-sim/rl_weights`
+/// when invoked from the repository root or `rl_weights` when invoked from `itch-ouch-sim/`.
+pub fn rl_weights_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("ITCH_OUCH_RL_WEIGHTS_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    if Path::new("itch-ouch-sim/Cargo.toml").exists() {
+        PathBuf::from("itch-ouch-sim/rl_weights")
+    } else {
+        PathBuf::from("rl_weights")
+    }
+}
+
+/// Atomically writes `content` to `path` via a sibling temporary file + `fs::rename`.
+fn atomic_write_text(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let seq = RL_TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+    fs::write(&tmp_path, content)?;
+    fs::rename(&tmp_path, path)
+}
 
 /// Fast xorshift64 PRNG for lock-free epsilon-greedy exploration
 #[inline]
@@ -1313,6 +1392,7 @@ fn next_u64_rng(state: &mut u64) -> u64 {
 /// - Inventory bucket (`0..5`): Deep Short, Mild Short, Neutral, Mild Long, Deep Long
 /// - Order-Book Imbalance (`0..3`): Bearish (`< -0.15`), Balanced, Bullish (`> +0.15`)
 /// - Volatility / Toxicity (`0..3`): Calm, Moderate, Turbulent/Toxic
+#[derive(Clone, Debug)]
 pub struct QLearningTable {
     pub q: [[f64; Self::NUM_ACTIONS]; Self::NUM_STATES],
     pub updates: u64,
@@ -1321,6 +1401,11 @@ pub struct QLearningTable {
 impl QLearningTable {
     pub const NUM_STATES: usize = 45;
     pub const NUM_ACTIONS: usize = 6;
+    pub const WEIGHTS_FILE_NAME: &'static str = "bot4_q_table.weights";
+
+    pub fn default_weights_path() -> PathBuf {
+        rl_weights_dir().join(Self::WEIGHTS_FILE_NAME)
+    }
 
     pub fn new_with_priors() -> Self {
         let mut q = [[0.0; Self::NUM_ACTIONS]; Self::NUM_STATES];
@@ -1344,6 +1429,88 @@ impl QLearningTable {
             }
         }
         Self { q, updates: 0 }
+    }
+
+    /// Loads persisted Q-Learning weights from `path`, or initializes with domain priors and saves them.
+    pub fn load_or_init(path: &Path) -> Self {
+        match Self::load_from_file(path) {
+            Ok(table) => table,
+            Err(_) => {
+                let table = Self::new_with_priors();
+                let _ = table.save_to_file(path);
+                table
+            }
+        }
+    }
+
+    /// Serializes the Q-table and cumulative update count to human-readable text.
+    pub fn to_weights_string(&self) -> String {
+        let mut out = String::with_capacity(2048);
+        out.push_str("# ITCH-OUCH-SIM TabularQLearningMM Weights v1\n");
+        out.push_str(&format!("updates={}\n", self.updates));
+        for (s, row) in self.q.iter().enumerate() {
+            out.push_str(&format!(
+                "state {} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8}\n",
+                s, row[0], row[1], row[2], row[3], row[4], row[5]
+            ));
+        }
+        out
+    }
+
+    /// Parses Q-table weights and cumulative update count from text.
+    pub fn from_weights_str(content: &str) -> std::io::Result<Self> {
+        let mut table = Self::new_with_priors();
+        let mut parsed_states = 0usize;
+
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("updates=") {
+                table.updates = rest
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 2 + Self::NUM_ACTIONS && parts[0] == "state" {
+                let s = parts[1]
+                    .parse::<usize>()
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                if s >= Self::NUM_STATES {
+                    return Err(Error::new(ErrorKind::InvalidData, "state index out of range"));
+                }
+                for a in 0..Self::NUM_ACTIONS {
+                    let val = parts[2 + a]
+                        .parse::<f64>()
+                        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                    if !val.is_finite() {
+                        return Err(Error::new(ErrorKind::InvalidData, "non-finite Q value"));
+                    }
+                    table.q[s][a] = val;
+                }
+                parsed_states += 1;
+            }
+        }
+
+        if parsed_states != Self::NUM_STATES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "incomplete Q-table state rows",
+            ));
+        }
+        Ok(table)
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
+        atomic_write_text(path, &self.to_weights_string())
+    }
+
+    pub fn load_from_file(path: &Path) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        Self::from_weights_str(&content)
     }
 
     pub fn encode_state(pos: i64, obi: f64, vol: f64, toxicity: f64) -> usize {
@@ -1448,15 +1615,22 @@ impl QLearningTable {
 /// - Arm `1`: Snipe Ask (Aggressive Buy)
 /// - Arm `2`: Hit Bid (Aggressive Sell)
 /// - Arm `3`: Passive BBO Peg on Microprice Side
+#[derive(Clone, Debug)]
 pub struct ContextualBandit {
     pub mean_reward: [[f64; Self::NUM_ARMS]; Self::NUM_CONTEXTS],
     pub counts: [[u64; Self::NUM_ARMS]; Self::NUM_CONTEXTS],
     pub context_visits: [u64; Self::NUM_CONTEXTS],
+    pub updates: u64,
 }
 
 impl ContextualBandit {
     pub const NUM_CONTEXTS: usize = 9;
     pub const NUM_ARMS: usize = 4;
+    pub const WEIGHTS_FILE_NAME: &'static str = "bot4_bandit.weights";
+
+    pub fn default_weights_path() -> PathBuf {
+        rl_weights_dir().join(Self::WEIGHTS_FILE_NAME)
+    }
 
     pub fn new_with_priors() -> Self {
         let mut mean_reward = [[0.0; Self::NUM_ARMS]; Self::NUM_CONTEXTS];
@@ -1488,8 +1662,117 @@ impl ContextualBandit {
         Self {
             mean_reward,
             counts,
-            context_visits: context_visits,
+            context_visits,
+            updates: 0,
         }
+    }
+
+    /// Loads persisted Contextual Bandit weights from `path`, or initializes with priors and saves them.
+    pub fn load_or_init(path: &Path) -> Self {
+        match Self::load_from_file(path) {
+            Ok(bandit) => bandit,
+            Err(_) => {
+                let bandit = Self::new_with_priors();
+                let _ = bandit.save_to_file(path);
+                bandit
+            }
+        }
+    }
+
+    /// Serializes Contextual Bandit counts, visit totals, and arm rewards to human-readable text.
+    pub fn to_weights_string(&self) -> String {
+        let mut out = String::with_capacity(1024);
+        out.push_str("# ITCH-OUCH-SIM ContextualBanditTaker Weights v1\n");
+        out.push_str(&format!("updates={}\n", self.updates));
+        for ctx in 0..Self::NUM_CONTEXTS {
+            let c = &self.counts[ctx];
+            let r = &self.mean_reward[ctx];
+            out.push_str(&format!(
+                "context {} visits {} counts {} {} {} {} rewards {:.8} {:.8} {:.8} {:.8}\n",
+                ctx,
+                self.context_visits[ctx],
+                c[0],
+                c[1],
+                c[2],
+                c[3],
+                r[0],
+                r[1],
+                r[2],
+                r[3]
+            ));
+        }
+        out
+    }
+
+    /// Parses Contextual Bandit state from text.
+    pub fn from_weights_str(content: &str) -> std::io::Result<Self> {
+        let mut bandit = Self::new_with_priors();
+        let mut parsed_contexts = 0usize;
+
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("updates=") {
+                bandit.updates = rest
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: context <ctx> visits <v> counts <c0> <c1> <c2> <c3> rewards <r0> <r1> <r2> <r3>
+            if parts.len() == 14
+                && parts[0] == "context"
+                && parts[2] == "visits"
+                && parts[4] == "counts"
+                && parts[9] == "rewards"
+            {
+                let ctx = parts[1]
+                    .parse::<usize>()
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                if ctx >= Self::NUM_CONTEXTS {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "context index out of range",
+                    ));
+                }
+                bandit.context_visits[ctx] = parts[3]
+                    .parse::<u64>()
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                for arm in 0..Self::NUM_ARMS {
+                    bandit.counts[ctx][arm] = parts[5 + arm]
+                        .parse::<u64>()
+                        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                    let val = parts[10 + arm]
+                        .parse::<f64>()
+                        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                    if !val.is_finite() {
+                        return Err(Error::new(ErrorKind::InvalidData, "non-finite arm reward"));
+                    }
+                    bandit.mean_reward[ctx][arm] = val;
+                }
+                parsed_contexts += 1;
+            }
+        }
+
+        if parsed_contexts != Self::NUM_CONTEXTS {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "incomplete ContextualBandit rows",
+            ));
+        }
+        Ok(bandit)
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
+        atomic_write_text(path, &self.to_weights_string())
+    }
+
+    pub fn load_from_file(path: &Path) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        Self::from_weights_str(&content)
     }
 
     pub fn encode_context(obi: f64, toxicity: f64) -> usize {
@@ -1548,6 +1831,7 @@ impl ContextualBandit {
         let a = arm.min(Self::NUM_ARMS - 1);
         self.counts[c][a] += 1;
         self.context_visits[c] += 1;
+        self.updates += 1;
         // Exponentially recency-weighted mean update for non-stationary order book dynamics
         const BETA: f64 = 0.15;
         self.mean_reward[c][a] = (1.0 - BETA) * self.mean_reward[c][a] + BETA * reward;
@@ -1676,6 +1960,42 @@ mod tests {
             bandit.update(ctx, 2, -2.0);
         }
         assert_eq!(bandit.select_arm(ctx, 0, 600, 0.05), 1);
+    }
+
+    #[test]
+    fn test_rl_weights_persistence_roundtrip() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "itch_ouch_rl_test_{}",
+             std::process::id()
+        ));
+        let q_path = tmp_dir.join("q_table.weights");
+        let b_path = tmp_dir.join("bandit.weights");
+
+        let mut q_table = QLearningTable::new_with_priors();
+        let s = QLearningTable::encode_state(-120, 0.25, 12.0, 0.10);
+        for _ in 0..15 {
+            q_table.update(s, 4, 3.25, s, 0.20, 0.92);
+        }
+        q_table.save_to_file(&q_path).expect("save Q-table");
+
+        let loaded_q = QLearningTable::load_from_file(&q_path).expect("load Q-table");
+        assert_eq!(loaded_q.updates, 15);
+        assert!((loaded_q.q[s][4] - q_table.q[s][4]).abs() < 1e-6);
+
+        let mut bandit = ContextualBandit::new_with_priors();
+        let ctx = ContextualBandit::encode_context(-0.30, -0.35);
+        for _ in 0..12 {
+            bandit.update(ctx, 2, 1.85);
+        }
+        bandit.save_to_file(&b_path).expect("save Bandit");
+
+        let loaded_b = ContextualBandit::load_from_file(&b_path).expect("load Bandit");
+        assert_eq!(loaded_b.updates, 12);
+        assert_eq!(loaded_b.counts[ctx][2], bandit.counts[ctx][2]);
+        assert_eq!(loaded_b.context_visits[ctx], bandit.context_visits[ctx]);
+        assert!((loaded_b.mean_reward[ctx][2] - bandit.mean_reward[ctx][2]).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
 
