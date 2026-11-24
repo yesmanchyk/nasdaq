@@ -1,13 +1,18 @@
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+
+#ifdef USE_CXX_MODULES
+import common;
+import trading;
+#else
 #include "common/lf_queue.hpp"
 #include "common/mem_pool.hpp"
 #include "common/protocol.hpp"
 #include "trading/feature_engine.hpp"
 #include "trading/market_order_book.hpp"
 #include "trading/risk_manager.hpp"
-
-#include <cmath>
-#include <cstdlib>
-#include <iostream>
+#endif
 
 #define REQUIRE(cond)                                                                      \
     do {                                                                                   \

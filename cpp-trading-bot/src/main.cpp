@@ -1,9 +1,3 @@
-#include "common/lf_queue.hpp"
-#include "common/protocol.hpp"
-#include "trading/market_data_consumer.hpp"
-#include "trading/order_gateway.hpp"
-#include "trading/trade_engine.hpp"
-
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -15,6 +9,17 @@
 #include <iostream>
 #include <string>
 #include <thread>
+
+#ifdef USE_CXX_MODULES
+import common;
+import trading;
+#else
+#include "common/lf_queue.hpp"
+#include "common/protocol.hpp"
+#include "trading/market_data_consumer.hpp"
+#include "trading/order_gateway.hpp"
+#include "trading/trade_engine.hpp"
+#endif
 
 namespace {
 

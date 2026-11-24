@@ -13,11 +13,27 @@ A zero-dependency C++20 low-latency trading client modeled after [`PacktPublishi
 
 ## Build & Test
 
+### Default Header Build (CMake 3.16+)
+
 ```bash
 cd cpp-trading-bot
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+```
+
+### Opt-In C++20 Modules Build (`-DUSE_CXX_MODULES=ON`)
+
+Requires **CMake 3.28+**, **Ninja** (or Visual Studio), and a C++20 Modules-capable compiler (**Clang 16+**, **GCC 14+**, or **MSVC**). Builds `modules/common.cppm` and `modules/trading.cppm` via `FILE_SET CXX_MODULES`:
+
+```bash
+cd cpp-trading-bot
+cmake -S . -B build-modules -G Ninja \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_CXX_MODULES=ON
+cmake --build build-modules -j
+ctest --test-dir build-modules --output-on-failure
 ```
 
 ## Run Live Against the Rust Exchange & Rust Bots
