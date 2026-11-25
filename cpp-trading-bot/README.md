@@ -38,12 +38,12 @@ ctest --test-dir build-modules --output-on-failure
 
 ## Run Live Against the Rust Exchange & Rust Bots
 
-Start the Rust `sim` (or standalone `exchange` + `bot`s) in Terminal 1:
+`sim` automatically discovers (or builds via CMake) and launches `cpp_trading_bot` as **Bot 5** alongside the 4 Rust bots:
 ```bash
 cargo run --manifest-path itch-ouch-sim/Cargo.toml --release -- 10000
 ```
 
-Launch the C++20 bot in Terminal 2 to compete head-to-head on the same order book:
+You can also pass `--no-cpp` to `sim` and launch `cpp_trading_bot` standalone in a separate terminal:
 ```bash
 ./cpp-trading-bot/build/cpp_trading_bot --id 5 --duration-ms 8000 --history-csv itch-ouch-sim/sim_history/runs.csv
 ```

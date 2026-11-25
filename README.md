@@ -44,7 +44,7 @@ cargo build --manifest-path itch-ouch-sim/Cargo.toml --release
 # Launch the real-time GUI client (includes 1-click Built-in Sim)
 cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin itch_client
 
-# Or run the headless Exchange + 4 Rust bots for 10 seconds
+# Or run the headless Exchange + 4 Rust bots + C++20 Bot 5 for 10 seconds
 cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin sim -- 10000
 ```
 

@@ -92,7 +92,7 @@ flowchart LR
 | `src/bot.rs` | Multi-threaded bot client (`spawn_bot`) with a dedicated PGM ITCH receiver thread (maintaining a local `ShadowBook` with microprice, multi-level Order Book Imbalance, EWMA volatility, and order-flow toxicity analytics), a TCP OUCH reader thread (tracking real-time inventory and mark-to-market PnL), a serialized TCP OUCH writer thread (`mpsc::Receiver<OuchInbound>`), and **2 concurrent strategy threads**. |
 | `src/bin/exchange.rs` | Standalone Exchange Server executable (`exchange`). |
 | `src/bin/bot.rs` | Standalone Trading Bot executable (`bot`). |
-| `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange and all four bots. |
+| `src/bin/sim.rs` | All-in-one simulation runner launching the standalone exchange, all four Rust bots (Bots 1–4), and the C++20 low-latency bot (`cpp_trading_bot`, Bot 5; pass `--no-cpp` to run Rust bots only). |
 | `src/bin/itch_client.rs` | Real-time **desktop GUI trading terminal** built with `eframe` / `egui` and `egui_plot`, featuring live price charts, L2 market depth ladder, interactive OUCH order submission/cancellation, order blotter with MTM PnL tracking, public Time & Sales tape, and a CLI fallback mode (`--cli`). |
 
 ---
