@@ -17,14 +17,16 @@ from datetime import datetime
 import os
 import sys
 
-DEFAULT_CSV = "/Users/alex/Projects/yesmanchyk/itch/nasdaq/itch-ouch-sim/sim_history/runs.csv"
-DEFAULT_OUT = "/Users/alex/Projects/yesmanchyk/itch/nasdaq/itch-ouch-sim/sim_history/profit_per_ms.svg"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CSV = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "sim_history", "runs.csv"))
+DEFAULT_OUT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "sim_history", "profit_per_ms.svg"))
 
 BOT_PALETTE = {
     1: {"color": "#ef4444", "light": "#f87171", "label": "Bot-1 (MM + MeanRev)"},
     2: {"color": "#10b981", "light": "#34d399", "label": "Bot-2 (Mom + Taker)"},
     3: {"color": "#3b82f6", "light": "#60a5fa", "label": "Bot-3 (Smart AS+OBI)"},
     4: {"color": "#a855f7", "light": "#c084fc", "label": "Bot-4 (RL Q+Bandit)"},
+    5: {"color": "#f59e0b", "light": "#fbbf24", "label": "Bot-5 (C++ LowLat)"},
 }
 
 FALLBACK_COLORS = ["#f59e0b", "#ec4899", "#14b8a6", "#6366f1"]
@@ -423,10 +425,15 @@ def try_matplotlib_plot(runs, out_path):
 
     png_path = os.path.splitext(out_path)[0] + ".png"
     plt.tight_layout()
-    plt.savefig(png_path, dpi=200, facecolor=plt.gcf().get_facecolor())
-    plt.close()
-    print(f"-> Generated Matplotlib PNG plot: {png_path}")
-    return True
+    try:
+        plt.savefig(png_path, dpi=200, facecolor=plt.gcf().get_facecolor())
+        print(f"-> Generated Matplotlib PNG plot: {png_path}")
+        return True
+    except Exception as e:
+        print(f"Note: Could not save PNG via matplotlib ({e})")
+        return False
+    finally:
+        plt.close()
 
 
 def main():

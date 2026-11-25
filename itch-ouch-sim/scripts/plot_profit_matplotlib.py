@@ -17,14 +17,16 @@ except ImportError:
     print("Error: matplotlib is required for this script. Install with: pip install matplotlib", file=sys.stderr)
     sys.exit(1)
 
-DEFAULT_CSV = "/Users/alex/Projects/yesmanchyk/itch/nasdaq/itch-ouch-sim/sim_history/runs.csv"
-DEFAULT_OUT = "/Users/alex/Projects/yesmanchyk/itch/nasdaq/itch-ouch-sim/sim_history/profit_per_ms.png"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CSV = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "sim_history", "runs.csv"))
+DEFAULT_OUT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "sim_history", "profit_per_ms.png"))
 
 BOT_STYLE = {
     1: {"color": "#ef4444", "marker": "o", "label": "Bot-1 (MM + MeanRev)"},
     2: {"color": "#10b981", "marker": "s", "label": "Bot-2 (Mom + Taker)"},
     3: {"color": "#3b82f6", "marker": "^", "label": "Bot-3 (Smart AS+OBI)"},
     4: {"color": "#a855f7", "marker": "D", "label": "Bot-4 (RL Q+Bandit)"},
+    5: {"color": "#f59e0b", "marker": "P", "label": "Bot-5 (C++ LowLat)"},
 }
 
 def main():
