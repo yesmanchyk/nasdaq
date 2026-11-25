@@ -304,6 +304,12 @@ pub struct BotState {
     pub cancels_count: AtomicU64,
     pub rl_q_updates: AtomicU64,
     pub rl_bandit_updates: AtomicU64,
+    /// Per-strategy position & cash attribution (indexed by `strat_idx & 1`, determined by
+    /// bit 0 of `cl_ord_id` = `(cl_ord_id & 1) as usize`) so concurrent RL learners
+    /// (`TabularQLearningMM` vs `ContextualBanditTaker`) receive clean, isolated reward signals.
+    pub strat_position: [AtomicI64; 2],
+    pub strat_cash_fp: [AtomicI64; 2],
+    pub strat_fills: [AtomicU64; 2],
     next_cl_ord_id: AtomicU64,
 }
 
@@ -328,12 +334,31 @@ impl BotState {
             cancels_count: AtomicU64::new(0),
             rl_q_updates: AtomicU64::new(0),
             rl_bandit_updates: AtomicU64::new(0),
-            next_cl_ord_id: AtomicU64::new(bot_id_prefix * 1_000_000 + 1),
+            strat_position: [AtomicI64::new(0), AtomicI64::new(0)],
+            strat_cash_fp: [AtomicI64::new(0), AtomicI64::new(0)],
+            strat_fills: [AtomicU64::new(0), AtomicU64::new(0)],
+            next_cl_ord_id: AtomicU64::new(bot_id_prefix * 1_000_000 + 2),
         }
     }
 
     pub fn next_id(&self) -> u64 {
-        self.next_cl_ord_id.fetch_add(1, Ordering::Relaxed)
+        self.next_cl_ord_id.fetch_add(2, Ordering::Relaxed)
+    }
+
+    /// Generates a unique `cl_ord_id` whose lowest bit encodes `strat_idx & 1`
+    /// so the OUCH execution reader can attribute fills to the originating strategy thread.
+    pub fn next_id_for_strategy(&self, strat_idx: usize) -> u64 {
+        let base = self.next_cl_ord_id.fetch_add(2, Ordering::Relaxed) & !1u64;
+        base | ((strat_idx as u64) & 1)
+    }
+
+    /// Returns `(strategy_mtm_pnl_fp, strategy_position, strategy_fills)` marked at `mark_fp`.
+    pub fn strategy_pnl(&self, strat_idx: usize, mark_fp: u64) -> (i64, i64, u64) {
+        let idx = strat_idx & 1;
+        let pos = self.strat_position[idx].load(Ordering::Relaxed);
+        let cash = self.strat_cash_fp[idx].load(Ordering::Relaxed);
+        let fills = self.strat_fills[idx].load(Ordering::Relaxed);
+        (cash + pos * (mark_fp as i64), pos, fills)
     }
 
     /// Clamps requested order size to what the bot can afford within its fixed capital budget (1x equity).
@@ -598,22 +623,33 @@ pub fn spawn_bot(
                                     state.cancels_count.fetch_add(1, Ordering::Relaxed);
                                 }
                                 OuchOutbound::OrderExecuted {
+                                    cl_ord_id,
                                     side,
                                     executed_shares,
                                     fill_price,
                                     ..
                                 } => {
                                     state.fills_count.fetch_add(1, Ordering::Relaxed);
+                                    let strat_slot = (cl_ord_id & 1) as usize;
+                                    state.strat_fills[strat_slot].fetch_add(1, Ordering::Relaxed);
                                     let qty = executed_shares as i64;
                                     let notional = qty * (fill_price as i64);
                                     match side {
                                         Side::Buy => {
                                             state.position.fetch_add(qty, Ordering::Relaxed);
                                             state.cash_fp.fetch_sub(notional, Ordering::Relaxed);
+                                            state.strat_position[strat_slot]
+                                                .fetch_add(qty, Ordering::Relaxed);
+                                            state.strat_cash_fp[strat_slot]
+                                                .fetch_sub(notional, Ordering::Relaxed);
                                         }
                                         Side::Sell => {
                                             state.position.fetch_sub(qty, Ordering::Relaxed);
                                             state.cash_fp.fetch_add(notional, Ordering::Relaxed);
+                                            state.strat_position[strat_slot]
+                                                .fetch_sub(qty, Ordering::Relaxed);
+                                            state.strat_cash_fp[strat_slot]
+                                                .fetch_add(notional, Ordering::Relaxed);
                                         }
                                     }
                                 }
@@ -1099,12 +1135,14 @@ fn run_strategy(
                     state.rl_q_updates.store(table.updates, Ordering::Relaxed);
                     table
                 });
-                let alpha = (learning_rate_bps as f64 / 10_000.0).clamp(0.01, 0.99);
-                let gamma = (discount_bps as f64 / 10_000.0).clamp(0.0, 0.999);
+                let base_alpha = (learning_rate_bps as f64 / 10_000.0).clamp(0.01, 0.50);
+                let alpha = (base_alpha / (1.0 + (q_agent.updates as f64) * 0.0002)).max(0.02);
+                let gamma = (discount_bps as f64 / 10_000.0).clamp(0.0, 0.99);
 
-                let (fair_px, obi, vol, toxicity, best_bid, best_ask) = {
+                let (mid_px, fair_px, obi, vol, toxicity, best_bid, best_ask) = {
                     let b = state.book.read().unwrap();
                     (
+                        b.mid_price(),
                         b.smart_fair_value(),
                         b.order_book_imbalance(5),
                         b.ewma_volatility_fp(),
@@ -1113,36 +1151,57 @@ fn run_strategy(
                         b.best_ask(),
                     )
                 };
-                let snap = state.pnl_snapshot();
-                let pos = snap.position;
-                let cur_state = QLearningTable::encode_state(pos, obi, vol, toxicity);
+                // Per-strategy PnL attribution (marked to microprice-aware fair value) plus bot-wide inventory
+                let (strat_pnl_fp, strat_pos, _) = state.strategy_pnl(strat_idx, fair_px);
+                let total_pos = state.position.load(Ordering::Relaxed);
+                let cur_state = QLearningTable::encode_state(total_pos, obi, vol, toxicity);
 
                 // Online Bellman TD(0) update from previous transition (s, a, r, s')
                 if let Some((prev_state, prev_action, prev_pnl_fp)) = prev_q_step {
                     let delta_pnl_dollars =
-                        (snap.mtm_pnl_fp - prev_pnl_fp) as f64 / (PRICE_SCALE as f64);
-                    // Quadratic inventory penalty encourages mean-reverting inventory control
-                    let inv_norm = (pos as f64) / 150.0;
-                    let reward = delta_pnl_dollars - 0.08 * (inv_norm * inv_norm);
+                        (strat_pnl_fp - prev_pnl_fp) as f64 / (PRICE_SCALE as f64);
+                    // Mild inventory risk penalty + adverse-toxicity penalty when holding inventory against flow
+                    let inv_norm = (strat_pos as f64) / (max_inventory.max(100) as f64);
+                    let flow_align = (strat_pos as f64 / 200.0) * (0.5 * obi + 0.5 * toxicity);
+                    let raw_reward = delta_pnl_dollars - 0.015 * (inv_norm * inv_norm) + 0.02 * flow_align;
+                    let reward = raw_reward.clamp(-2.5, 2.5);
                     q_agent.update(prev_state, prev_action, reward, cur_state, alpha, gamma);
                     state.rl_q_updates.store(q_agent.updates, Ordering::Relaxed);
-                    // Periodically checkpoint weights to disk so progress is preserved even on abrupt stop
                     if q_agent.updates.is_multiple_of(25) {
                         let _ = q_agent.save_to_file(&QLearningTable::default_weights_path());
                     }
                 }
 
-                // Decaying epsilon-greedy exploration driven by cumulative persisted updates across runs
-                let epsilon = (0.18 / (1.0 + (q_agent.updates as f64) * 0.008)).max(0.03);
+                let epsilon = (0.15 / (1.0 + (q_agent.updates as f64) * 0.005)).max(0.02);
                 let action = q_agent.select_action(cur_state, epsilon, &mut rng_state);
-                prev_q_step = Some((cur_state, action, snap.mtm_pnl_fp));
+                prev_q_step = Some((cur_state, action, strat_pnl_fp));
 
-                let (bid_offset, ask_offset) = QLearningTable::action_offsets(action, pos);
-                let inv_skew = (pos / 80) * 3;
-                let center_px = (fair_px as i64 - inv_skew).max(10_000) as u64;
+                let (bid_offset, ask_offset) = QLearningTable::action_offsets(action, total_pos);
 
-                let mut target_bid = center_px.saturating_sub(bid_offset).max(10_000);
-                let mut target_ask = (center_px + ask_offset).max(10_001);
+                // Avellaneda-Stoikov reservation skew + toxicity protection against Bot 2's momentum flow
+                let sigma = vol.clamp(3.0, 50.0);
+                let inv_skew = (total_pos as f64) * 0.0018 * sigma * 2.2;
+                let tox_shift = (14.0 * toxicity + 10.0 * obi).round();
+                let center_px = (fair_px as f64 - inv_skew + tox_shift)
+                    .round()
+                    .max(10_000.0) as u64;
+
+                // Pull back the vulnerable side when order flow toxicity or OBI is strongly directional
+                let bid_tox_guard = if toxicity < -0.12 || obi < -0.15 {
+                    ((-toxicity).max(-obi) * 26.0).round() as u64
+                } else {
+                    0
+                };
+                let ask_tox_guard = if toxicity > 0.12 || obi > 0.15 {
+                    (toxicity.max(obi) * 26.0).round() as u64
+                } else {
+                    0
+                };
+
+                let mut target_bid = center_px
+                    .saturating_sub(bid_offset + bid_tox_guard)
+                    .max(10_000);
+                let mut target_ask = (center_px + ask_offset + ask_tox_guard).max(10_001);
 
                 if let Some((a_px, _)) = best_ask {
                     target_bid = target_bid.min(a_px.saturating_sub(1));
@@ -1154,22 +1213,36 @@ fn run_strategy(
                     target_ask = target_bid + 2;
                 }
 
-                let force_refresh = tick.is_multiple_of(5);
+                // Disable quoting on the exposed side when Action 2 (Defensive Stand-Aside) is chosen under toxic flow
+                // or when action is one-sided inventory unwinding
+                let allow_bid = total_pos < max_inventory
+                    && !(action == 2 && toxicity < -0.18 && total_pos >= 0)
+                    && !(action == 4 && total_pos > max_inventory / 2);
+                let allow_ask = total_pos > -max_inventory
+                    && !(action == 2 && toxicity > 0.18 && total_pos <= 0)
+                    && !(action == 3 && total_pos < -max_inventory / 2);
 
-                if pos < max_inventory {
+                let _ = mid_px;
+
+                if allow_bid {
+                    // Preserve queue priority unless target price moved by more than 3 ticks
                     let need_new_bid = match resting_bid {
-                        Some((_, old_px)) => force_refresh || old_px.abs_diff(target_bid) > 2,
+                        Some((_, old_px)) => old_px.abs_diff(target_bid) > 3,
                         None => true,
                     };
                     if need_new_bid {
                         if let Some((old_id, _)) = resting_bid.take() {
                             let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
                         }
-                        let bid_id = state.next_id();
+                        let inv_ratio = ((max_inventory - total_pos) as f64
+                            / (max_inventory as f64))
+                            .clamp(0.25, 1.35);
+                        let bid_shares = ((lot_size as f64) * inv_ratio).round().max(10.0) as u32;
+                        let bid_id = state.next_id_for_strategy(strat_idx);
                         let _ = tx.send(OuchInbound::EnterOrder {
                             cl_ord_id: bid_id,
                             side: Side::Buy,
-                            shares: lot_size,
+                            shares: bid_shares,
                             price: target_bid,
                         });
                         resting_bid = Some((bid_id, target_bid));
@@ -1178,20 +1251,24 @@ fn run_strategy(
                     let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
                 }
 
-                if pos > -max_inventory {
+                if allow_ask {
                     let need_new_ask = match resting_ask {
-                        Some((_, old_px)) => force_refresh || old_px.abs_diff(target_ask) > 2,
+                        Some((_, old_px)) => old_px.abs_diff(target_ask) > 3,
                         None => true,
                     };
                     if need_new_ask {
                         if let Some((old_id, _)) = resting_ask.take() {
                             let _ = tx.send(OuchInbound::CancelOrder { cl_ord_id: old_id });
                         }
-                        let ask_id = state.next_id();
+                        let inv_ratio = ((max_inventory + total_pos) as f64
+                            / (max_inventory as f64))
+                            .clamp(0.25, 1.35);
+                        let ask_shares = ((lot_size as f64) * inv_ratio).round().max(10.0) as u32;
+                        let ask_id = state.next_id_for_strategy(strat_idx);
                         let _ = tx.send(OuchInbound::EnterOrder {
                             cl_ord_id: ask_id,
                             side: Side::Sell,
-                            shares: lot_size,
+                            shares: ask_shares,
                             price: target_ask,
                         });
                         resting_ask = Some((ask_id, target_ask));
@@ -1221,25 +1298,36 @@ fn run_strategy(
                 });
                 let exploration_c = (exploration_bps as f64 / 10_000.0).max(0.01);
 
-                let (smart_fv, obi, toxicity, best_bid, best_ask) = {
+                let (smart_fv, obi, toxicity, buy_vol, sell_vol, best_bid, best_ask) = {
                     let b = state.book.read().unwrap();
                     (
                         b.smart_fair_value(),
                         b.order_book_imbalance(5),
                         b.order_flow_toxicity(),
+                        b.recent_buy_exec_vol,
+                        b.recent_sell_exec_vol,
                         b.best_bid(),
                         b.best_ask(),
                     )
                 };
-                let snap = state.pnl_snapshot();
-                let pos = snap.position;
+                // Isolated Bandit strategy PnL & position so MM fills do not corrupt Bandit arm values
+                let (strat_pnl_fp, strat_pos, _) = state.strategy_pnl(strat_idx, smart_fv);
+                let total_pos = state.position.load(Ordering::Relaxed);
 
                 // Online contextual bandit update from previous step's realized reward
                 if let Some((prev_ctx, prev_arm, prev_pnl_fp)) = prev_bandit_step {
                     let delta_pnl_dollars =
-                        (snap.mtm_pnl_fp - prev_pnl_fp) as f64 / (PRICE_SCALE as f64);
-                    let inv_norm = (pos as f64) / 200.0;
-                    let reward = delta_pnl_dollars - 0.05 * (inv_norm * inv_norm);
+                        (strat_pnl_fp - prev_pnl_fp) as f64 / (PRICE_SCALE as f64);
+                    let inv_norm = (strat_pos as f64) / (max_inventory.max(100) as f64);
+                    // Reward actual PnL capture + alignment between arm direction and realized order flow
+                    let dir_edge = match prev_arm {
+                        1 => 0.04 * (0.5 * obi + 0.5 * toxicity),
+                        2 => -0.04 * (0.5 * obi + 0.5 * toxicity),
+                        3 => -0.02 * inv_norm.abs(),
+                        _ => -0.005 * inv_norm.abs(),
+                    };
+                    let raw_reward = delta_pnl_dollars + dir_edge - 0.01 * (inv_norm * inv_norm);
+                    let reward = raw_reward.clamp(-2.5, 2.5);
                     bandit.update(prev_ctx, prev_arm, reward);
                     state.rl_bandit_updates.store(bandit.updates, Ordering::Relaxed);
                     if bandit.updates.is_multiple_of(25) {
@@ -1247,54 +1335,65 @@ fn run_strategy(
                     }
                 }
 
-                let ctx = ContextualBandit::encode_context(obi, toxicity);
-                let arm = bandit.select_arm(ctx, pos, max_inventory, exploration_c);
-                prev_bandit_step = Some((ctx, arm, snap.mtm_pnl_fp));
+                let flow_signal = if buy_vol + sell_vol > 0 {
+                    (buy_vol as f64 - sell_vol as f64) / ((buy_vol + sell_vol) as f64)
+                } else {
+                    toxicity
+                };
+                let ctx = ContextualBandit::encode_context(obi, 0.6 * toxicity + 0.4 * flow_signal);
+                let arm = bandit.select_arm(ctx, total_pos, max_inventory, exploration_c);
+                prev_bandit_step = Some((ctx, arm, strat_pnl_fp));
 
                 match arm {
-                    // Arm 1: Snipe Ask (Aggressive Buy) when microprice/OBI supports it
+                    // Arm 1: Snipe Ask (Aggressive Momentum / OBI Buy)
                     1 => {
-                        if pos < max_inventory
-                            && let Some((ask_px, _)) = best_ask
-                            && smart_fv + 4 >= ask_px
+                        if total_pos < max_inventory
+                            && let Some((ask_px, ask_qty)) = best_ask
                         {
-                            let id = state.next_id();
-                            let _ = tx.send(OuchInbound::EnterOrder {
-                                cl_ord_id: id,
-                                side: Side::Buy,
-                                shares: lot_size,
-                                price: ask_px + 2,
-                            });
-                            active_orders.push(id);
+                            let room = (max_inventory - total_pos).max(0) as u32;
+                            let clip = lot_size.min(ask_qty.max(lot_size)).min(room);
+                            if clip > 0 {
+                                let id = state.next_id_for_strategy(strat_idx);
+                                let _ = tx.send(OuchInbound::EnterOrder {
+                                    cl_ord_id: id,
+                                    side: Side::Buy,
+                                    shares: clip,
+                                    price: ask_px + 12,
+                                });
+                                active_orders.push(id);
+                            }
                         }
                     }
-                    // Arm 2: Hit Bid (Aggressive Sell) when microprice/OBI supports it
+                    // Arm 2: Hit Bid (Aggressive Momentum / OBI Sell)
                     2 => {
-                        if pos > -max_inventory
-                            && let Some((bid_px, _)) = best_bid
-                            && smart_fv <= bid_px + 4
+                        if total_pos > -max_inventory
+                            && let Some((bid_px, bid_qty)) = best_bid
                         {
-                            let id = state.next_id();
-                            let _ = tx.send(OuchInbound::EnterOrder {
-                                cl_ord_id: id,
-                                side: Side::Sell,
-                                shares: lot_size,
-                                price: bid_px.saturating_sub(2),
-                            });
-                            active_orders.push(id);
+                            let room = (max_inventory + total_pos).max(0) as u32;
+                            let clip = lot_size.min(bid_qty.max(lot_size)).min(room);
+                            if clip > 0 {
+                                let id = state.next_id_for_strategy(strat_idx);
+                                let _ = tx.send(OuchInbound::EnterOrder {
+                                    cl_ord_id: id,
+                                    side: Side::Sell,
+                                    shares: clip,
+                                    price: bid_px.saturating_sub(12),
+                                });
+                                active_orders.push(id);
+                            }
                         }
                     }
-                    // Arm 3: Passive BBO Peg on Microprice-Favored or Inventory-Unwinding Side
+                    // Arm 3: Inventory-Unwinding / Microprice-Favored BBO Peg
                     3 => {
-                        if (obi >= 0.0 || pos < -100)
-                            && pos < max_inventory
+                        if (total_pos < -60 || (total_pos <= 60 && obi >= 0.0))
+                            && total_pos < max_inventory
                             && let Some((bid_px, _)) = best_bid
                         {
                             let peg_px = match best_ask {
                                 Some((ask_px, _)) if ask_px > bid_px + 2 => bid_px + 1,
                                 _ => bid_px,
                             };
-                            let id = state.next_id();
+                            let id = state.next_id_for_strategy(strat_idx);
                             let _ = tx.send(OuchInbound::EnterOrder {
                                 cl_ord_id: id,
                                 side: Side::Buy,
@@ -1302,14 +1401,14 @@ fn run_strategy(
                                 price: peg_px,
                             });
                             active_orders.push(id);
-                        } else if pos > -max_inventory
+                        } else if total_pos > -max_inventory
                             && let Some((ask_px, _)) = best_ask
                         {
                             let peg_px = match best_bid {
                                 Some((bid_px, _)) if ask_px > bid_px + 2 => ask_px - 1,
                                 _ => ask_px,
                             };
-                            let id = state.next_id();
+                            let id = state.next_id_for_strategy(strat_idx);
                             let _ = tx.send(OuchInbound::EnterOrder {
                                 cl_ord_id: id,
                                 side: Side::Sell,
@@ -1682,19 +1781,19 @@ impl QLearningTable {
     /// Maps discrete action `0..6` to `(bid_half_spread, ask_half_spread)` in fixed-point ticks.
     pub fn action_offsets(action: usize, pos: i64) -> (u64, u64) {
         match action {
-            0 => (9, 9),   // Tight Symmetric
-            1 => (16, 16), // Moderate Symmetric
-            2 => (28, 28), // Wide Defensive
-            3 => (6, 24),  // Skew Bid (accumulate long / cover short)
-            4 => (24, 6),  // Skew Ask (accumulate short / unwind long)
+            0 => (11, 11), // Tight Symmetric (low-vol neutral regime)
+            1 => (18, 18), // Moderate Symmetric
+            2 => (38, 38), // Wide Defensive / Stand-Aside under toxic flow
+            3 => (5, 32),  // Skew Bid (accumulate long / cover short / ride bullish OBI)
+            4 => (32, 5),  // Skew Ask (accumulate short / unwind long / ride bearish OBI)
             _ => {
-                // Action 5: Inventory-flattening peg
-                if pos > 40 {
-                    (26, 5)
-                } else if pos < -40 {
-                    (5, 26)
+                // Action 5: Aggressive Inventory-Flattening Peg
+                if pos > 30 {
+                    (36, 4)
+                } else if pos < -30 {
+                    (4, 36)
                 } else {
-                    (12, 12)
+                    (14, 14)
                 }
             }
         }
@@ -1731,22 +1830,30 @@ impl ContextualBandit {
         for obi_idx in 0..3 {
             for tox_idx in 0..3 {
                 let ctx = obi_idx * 3 + tox_idx;
-                // Arm 0: Hold
-                mean_reward[ctx][0] = 0.05;
-                // Arm 1: Snipe Ask — prior boost when OBI & flow are bullish (obi_idx == 2, tox_idx >= 1)
-                mean_reward[ctx][1] = if obi_idx == 2 && tox_idx >= 1 {
-                    0.35
+                // Arm 0: Hold (preferred when flow and OBI conflict or market is balanced)
+                mean_reward[ctx][0] = if obi_idx == 1 && tox_idx == 1 {
+                    0.22
                 } else {
-                    -0.10
+                    0.08
                 };
-                // Arm 2: Hit Bid — prior boost when OBI & flow are bearish (obi_idx == 0, tox_idx <= 1)
-                mean_reward[ctx][2] = if obi_idx == 0 && tox_idx <= 1 {
-                    0.35
+                // Arm 1: Snipe Ask — prior boost when OBI or trade flow is bullish
+                mean_reward[ctx][1] = if obi_idx == 2 && tox_idx == 2 {
+                    0.45
+                } else if (obi_idx == 2 && tox_idx >= 1) || (obi_idx >= 1 && tox_idx == 2) {
+                    0.32
                 } else {
-                    -0.10
+                    -0.15
+                };
+                // Arm 2: Hit Bid — prior boost when OBI or trade flow is bearish
+                mean_reward[ctx][2] = if obi_idx == 0 && tox_idx == 0 {
+                    0.45
+                } else if (obi_idx == 0 && tox_idx <= 1) || (obi_idx <= 1 && tox_idx == 0) {
+                    0.32
+                } else {
+                    -0.15
                 };
                 // Arm 3: Passive BBO Peg
-                mean_reward[ctx][3] = 0.18;
+                mean_reward[ctx][3] = 0.16;
             }
         }
 
@@ -1867,16 +1974,16 @@ impl ContextualBandit {
     }
 
     pub fn encode_context(obi: f64, toxicity: f64) -> usize {
-        let obi_idx = if obi < -0.12 {
+        let obi_idx = if obi < -0.10 {
             0
-        } else if obi > 0.12 {
+        } else if obi > 0.10 {
             2
         } else {
             1
         };
-        let tox_idx = if toxicity < -0.15 {
+        let tox_idx = if toxicity < -0.12 {
             0
-        } else if toxicity > 0.15 {
+        } else if toxicity > 0.12 {
             2
         } else {
             1
@@ -1903,8 +2010,8 @@ impl ContextualBandit {
             let ucb_bonus = exploration_c * (total_n / n).sqrt();
             // Mild inventory-unwinding preference
             let inv_bonus = match arm {
-                1 if pos < -100 => 0.10,
-                2 if pos > 100 => 0.10,
+                1 if pos < -100 => 0.12,
+                2 if pos > 100 => 0.12,
                 _ => 0.0,
             };
             let score = self.mean_reward[c][arm] + ucb_bonus + inv_bonus;
@@ -1923,9 +2030,9 @@ impl ContextualBandit {
         self.counts[c][a] += 1;
         self.context_visits[c] += 1;
         self.updates += 1;
-        // Exponentially recency-weighted mean update for non-stationary order book dynamics
-        const BETA: f64 = 0.15;
-        self.mean_reward[c][a] = (1.0 - BETA) * self.mean_reward[c][a] + BETA * reward;
+        // Adaptive recency-weighted step size (1/N early, floor 0.04 for non-stationary tracking)
+        let beta = (1.0 / (self.counts[c][a] as f64)).clamp(0.04, 0.20);
+        self.mean_reward[c][a] = (1.0 - beta) * self.mean_reward[c][a] + beta * reward;
     }
 }
 
