@@ -573,7 +573,7 @@ pub fn spawn_bot(
                         }
                     }
                     Ok(false) => {
-                        thread::sleep(Duration::from_micros(50));
+                        thread::yield_now();
                     }
                     Err(_) => break,
                 }
@@ -620,7 +620,7 @@ pub fn spawn_bot(
                             }
                         }
                     }
-                    Ok(None) => thread::sleep(Duration::from_micros(50)),
+                    Ok(None) => thread::yield_now(),
                     Err(_) => break,
                 }
             }

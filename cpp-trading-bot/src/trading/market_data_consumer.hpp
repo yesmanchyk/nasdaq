@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <map>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -211,7 +212,8 @@ private:
                 }
             }
             if (drained == 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                pollfd pfd{mcast_fd_, POLLIN, 0};
+                ::poll(&pfd, 1, 1);
             }
         }
     }

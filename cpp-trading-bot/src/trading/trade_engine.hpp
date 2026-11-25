@@ -294,7 +294,7 @@ private:
             }
 
             if (!did_work) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::yield();
             }
         }
 

@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -93,7 +94,8 @@ private:
             if (n > 0) {
                 sent += static_cast<std::size_t>(n);
             } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                pollfd pfd{sock_fd_, POLLOUT, 0};
+                ::poll(&pfd, 1, 1);
             } else {
                 return false;
             }
@@ -147,7 +149,7 @@ private:
             }
 
             if (!did_work) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::yield();
             }
         }
     }
