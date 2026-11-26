@@ -59,7 +59,8 @@ void appendHistoryCsv(
     if (is_new) {
         out << "timestamp_unix_s,source,duration_ms,bot_id,bot_name,start_cap_dollars,"
                "equity_dollars,mtm_pnl_dollars,cash_dollars,position_shares,"
-               "fills,acks,cancels,rl_q_updates,rl_bandit_updates\n";
+               "fills,acks,cancels,rl_q_updates,rl_bandit_updates,"
+               "open_price,high_price,low_price,close_price\n";
     }
     const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::system_clock::now().time_since_epoch())
@@ -72,7 +73,7 @@ void appendHistoryCsv(
     out << ts << ",cpp_bot," << duration_ms << "," << bot_id << "," << bot_name << ","
         << std::fixed << std::setprecision(2) << start_cap << "," << equity << "," << pnl << ","
         << cash << "," << p.position << "," << p.fills << "," << p.acks << "," << p.cancels
-        << ",0,0\n";
+        << ",0,0,,,,\n";
 }
 
 void printSummaryLine(

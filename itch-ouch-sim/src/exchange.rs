@@ -41,7 +41,22 @@ pub struct ExchangeStats {
     pub total_cancels: u64,
     pub total_trades: u64,
     pub total_volume: u64,
+    pub open_price: Option<u64>,
+    pub high_price: Option<u64>,
+    pub low_price: Option<u64>,
     pub last_trade_price: Option<u64>,
+}
+
+impl ExchangeStats {
+    /// Returns `(open, high, low, close)` trade prices in fixed-point units if at least one trade occurred.
+    pub fn ohlc(&self) -> Option<(u64, u64, u64, u64)> {
+        Some((
+            self.open_price?,
+            self.high_price?,
+            self.low_price?,
+            self.last_trade_price?,
+        ))
+    }
 }
 
 pub struct ExchangeServer {
@@ -76,6 +91,9 @@ impl ExchangeServer {
                 total_cancels: 0,
                 total_trades: 0,
                 total_volume: 0,
+                open_price: None,
+                high_price: None,
+                low_price: None,
                 last_trade_price: None,
             },
         })
@@ -357,6 +375,19 @@ impl ExchangeServer {
     ) {
         self.stats.total_trades += 1;
         self.stats.total_volume += fill_qty as u64;
+        if self.stats.open_price.is_none() {
+            self.stats.open_price = Some(fill_price);
+        }
+        self.stats.high_price = Some(
+            self.stats
+                .high_price
+                .map_or(fill_price, |h| h.max(fill_price)),
+        );
+        self.stats.low_price = Some(
+            self.stats
+                .low_price
+                .map_or(fill_price, |l| l.min(fill_price)),
+        );
         self.stats.last_trade_price = Some(fill_price);
 
         // Private TCP OUCH execution report to resting maker
@@ -478,19 +509,24 @@ impl ExchangeServer {
             })
             .unwrap_or_else(|| "None".to_string());
 
-        let last_px = self
-            .stats
-            .last_trade_price
-            .map(fmt_price)
-            .unwrap_or_else(|| "N/A".to_string());
+        let ohlc_str = match self.stats.ohlc() {
+            Some((o, h, l, c)) => format!(
+                "OHLC[O:${} H:${} L:${} C:${}]",
+                fmt_price(o),
+                fmt_price(h),
+                fmt_price(l),
+                fmt_price(c)
+            ),
+            None => "OHLC[N/A]".to_string(),
+        };
 
         format!(
-            "Orders: {} | Cancels: {} | Trades: {} | Vol: {} sh | LastPx: ${} | PGM[ODATA:{} RDATA:{} NAK:{}] | BBO: [Bid ${} x Ask ${}]",
+            "Orders: {} | Cancels: {} | Trades: {} | Vol: {} sh | {} | PGM[ODATA:{} RDATA:{} NAK:{}] | BBO: [Bid ${} x Ask ${}]",
             self.stats.total_orders,
             self.stats.total_cancels,
             self.stats.total_trades,
             self.stats.total_volume,
-            last_px,
+            ohlc_str,
             self.pgm.odata_sent,
             self.pgm.rdata_sent,
             self.pgm.naks_received,

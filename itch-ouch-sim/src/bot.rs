@@ -1478,6 +1478,26 @@ pub fn sim_history_dir() -> PathBuf {
     }
 }
 
+/// Open/High/Low/Close trade prices for a completed simulation run (in fixed-point 1/10_000 dollars).
+#[derive(Clone, Copy, Debug)]
+pub struct RunOhlc {
+    pub open_fp: u64,
+    pub high_fp: u64,
+    pub low_fp: u64,
+    pub close_fp: u64,
+}
+
+impl From<(u64, u64, u64, u64)> for RunOhlc {
+    fn from((open_fp, high_fp, low_fp, close_fp): (u64, u64, u64, u64)) -> Self {
+        Self {
+            open_fp,
+            high_fp,
+            low_fp,
+            close_fp,
+        }
+    }
+}
+
 /// Performance record for a single bot at the end of a simulation run.
 #[derive(Clone, Debug)]
 pub struct BotRunPerformance {
@@ -1485,6 +1505,8 @@ pub struct BotRunPerformance {
     pub name: String,
     pub pnl: BotPnl,
 }
+
+const RUN_HISTORY_HEADER: &str = "timestamp_unix_s,source,duration_ms,bot_id,bot_name,start_cap_dollars,equity_dollars,mtm_pnl_dollars,cash_dollars,position_shares,fills,acks,cancels,rl_q_updates,rl_bandit_updates,open_price,high_price,low_price,close_price";
 
 /// Appends a structured summary of a simulation run to `sim_history/runs.csv`.
 ///
@@ -1495,6 +1517,16 @@ pub fn append_run_history(
     duration_ms: u64,
     bots: &[BotRunPerformance],
 ) -> std::io::Result<PathBuf> {
+    append_run_history_with_ohlc(source, duration_ms, bots, None)
+}
+
+/// Appends a simulation run summary including optional exchange OHLC trade prices to `sim_history/runs.csv`.
+pub fn append_run_history_with_ohlc(
+    source: &str,
+    duration_ms: u64,
+    bots: &[BotRunPerformance],
+    ohlc: Option<RunOhlc>,
+) -> std::io::Result<PathBuf> {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::time::SystemTime;
@@ -1504,22 +1536,48 @@ pub fn append_run_history(
     let file_path = dir.join("runs.csv");
     let is_new = !file_path.exists() || fs::metadata(&file_path)?.len() == 0;
 
+    // Seamlessly upgrade legacy 15-column CSV headers to include OHLC columns
+    if !is_new {
+        if let Ok(existing) = fs::read_to_string(&file_path) {
+            if let Some(first_nl) = existing.find('\n') {
+                let first_line = existing[..first_nl].trim();
+                if first_line.starts_with("timestamp_unix_s,") && !first_line.contains("open_price")
+                {
+                    let upgraded = format!("{}{}", RUN_HISTORY_HEADER, &existing[first_nl..]);
+                    let _ = atomic_write_text(&file_path, &upgraded);
+                }
+            } else if existing.trim().starts_with("timestamp_unix_s,")
+                && !existing.contains("open_price")
+            {
+                let _ = atomic_write_text(&file_path, &format!("{RUN_HISTORY_HEADER}\n"));
+            }
+        }
+    }
+
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&file_path)?;
 
     if is_new {
-        writeln!(
-            file,
-            "timestamp_unix_s,source,duration_ms,bot_id,bot_name,start_cap_dollars,equity_dollars,mtm_pnl_dollars,cash_dollars,position_shares,fills,acks,cancels,rl_q_updates,rl_bandit_updates"
-        )?;
+        writeln!(file, "{RUN_HISTORY_HEADER}")?;
     }
 
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    let ohlc_cols = match ohlc {
+        Some(o) => format!(
+            "{:.4},{:.4},{:.4},{:.4}",
+            o.open_fp as f64 / (PRICE_SCALE as f64),
+            o.high_fp as f64 / (PRICE_SCALE as f64),
+            o.low_fp as f64 / (PRICE_SCALE as f64),
+            o.close_fp as f64 / (PRICE_SCALE as f64),
+        ),
+        None => ",,,".to_string(),
+    };
 
     for b in bots {
         let p = &b.pnl;
@@ -1529,7 +1587,7 @@ pub fn append_run_history(
         let cash = p.cash_fp as f64 / (PRICE_SCALE as f64);
         writeln!(
             file,
-            "{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{}",
+            "{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}",
             ts,
             source,
             duration_ms,
@@ -1544,7 +1602,8 @@ pub fn append_run_history(
             p.acks,
             p.cancels,
             p.rl_q_updates,
-            p.rl_bandit_updates
+            p.rl_bandit_updates,
+            ohlc_cols
         )?;
     }
     file.flush()?;

@@ -6,7 +6,8 @@
 //! (`239.255.0.1:30001`, NAK repair on `127.0.0.1:30002`).
 
 use itch_ouch_sim::bot::{
-    BotRunPerformance, append_run_history, default_strategies_for_bot, sim_history_dir, spawn_bot,
+    BotRunPerformance, RunOhlc, append_run_history_with_ohlc, default_strategies_for_bot,
+    sim_history_dir, spawn_bot,
 };
 use itch_ouch_sim::exchange::ExchangeServer;
 use itch_ouch_sim::pgm::{
@@ -405,7 +406,13 @@ fn main() -> std::io::Result<()> {
     let exchange = exchange_thread.join().unwrap();
 
     let actual_duration_ms = start.elapsed().as_millis() as u64;
-    let history_note = match append_run_history("sim", actual_duration_ms, &bot_perf_records) {
+    let run_ohlc = exchange.stats.ohlc().map(RunOhlc::from);
+    let history_note = match append_run_history_with_ohlc(
+        "sim",
+        actual_duration_ms,
+        &bot_perf_records,
+        run_ohlc,
+    ) {
         Ok(path) => format!("Saved run performance history to {}", path.display()),
         Err(e) => format!("Warning: failed to append run performance history: {e}"),
     };

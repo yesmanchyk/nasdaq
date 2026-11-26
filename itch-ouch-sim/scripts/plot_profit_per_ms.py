@@ -68,11 +68,19 @@ def load_data(csv_path):
                     "datetime": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
                     "duration_ms": dur_ms,
                     "sources": set(),
+                    "ohlc": None,
                     "bots": {},
                 }
             runs[ts]["sources"].add(row["source"])
             if row["source"] != "cpp_bot":
                 runs[ts]["duration_ms"] = dur_ms
+            if runs[ts]["ohlc"] is None:
+                o_s = (row.get("open_price") or "").strip()
+                h_s = (row.get("high_price") or "").strip()
+                l_s = (row.get("low_price") or "").strip()
+                c_s = (row.get("close_price") or "").strip()
+                if o_s and h_s and l_s and c_s:
+                    runs[ts]["ohlc"] = (float(o_s), float(h_s), float(l_s), float(c_s))
             runs[ts]["bots"][bot_id] = entry
 
     # Normalize combined run sources (e.g., sim + cpp_bot -> "sim+cpp")
@@ -94,8 +102,12 @@ def load_data(csv_path):
 
 def render_ascii_table(runs):
     bot_ids = sorted({b for r in runs for b in r["bots"]}) or [1, 2, 3, 4, 5]
+    has_ohlc = any(r.get("ohlc") is not None for r in runs)
     col_w = 22
+    ohlc_w = 37
     header_parts = [f"{'Run Date/Time':<20}", f"{'Source':<11}", f"{'Dur(ms)':<8}"]
+    if has_ohlc:
+        header_parts.append(f"{'OHLC (O / H / L / C)':<{ohlc_w}}")
     for b_id in bot_ids:
         header_parts.append(f"{f'Bot-{b_id} $/ms':<{col_w}}")
     header = " | ".join(header_parts)
@@ -111,6 +123,14 @@ def render_ascii_table(runs):
 
     for run in runs:
         cols = [f"{run['datetime']:<20}", f"{run['source']:<11}", f"{run['duration_ms']:<8.0f}"]
+        if has_ohlc:
+            ohlc = run.get("ohlc")
+            if ohlc is not None:
+                o, h, l, c = ohlc
+                ohlc_cell = f"{o:7.4f}/{h:7.4f}/{l:7.4f}/{c:7.4f}"
+                cols.append(f"{ohlc_cell:<{ohlc_w}}")
+            else:
+                cols.append(f"{'N/A':^{ohlc_w}}")
         for b_id in bot_ids:
             if b_id in run["bots"]:
                 rate_ms = run["bots"][b_id]["profit_per_ms"]
@@ -357,11 +377,102 @@ def render_html(runs, out_path):
         }
     }
 
+    has_ohlc = any(r.get("ohlc") is not None for r in runs)
+    ohlc_config = None
+    if has_ohlc:
+        ohlc_config = {
+            "type": "line",
+            "data": {
+                "labels": labels,
+                "datasets": [
+                    {
+                        "label": "High ($)",
+                        "data": [r["ohlc"][1] if r.get("ohlc") else None for r in runs],
+                        "borderColor": "#22c55e",
+                        "backgroundColor": "#22c55e22",
+                        "borderWidth": 1.5,
+                        "borderDash": [4, 3],
+                        "tension": 0.15,
+                        "pointRadius": 3,
+                    },
+                    {
+                        "label": "Low ($)",
+                        "data": [r["ohlc"][2] if r.get("ohlc") else None for r in runs],
+                        "borderColor": "#ef4444",
+                        "backgroundColor": "#38bdf81a",
+                        "borderWidth": 1.5,
+                        "borderDash": [4, 3],
+                        "fill": "-1",
+                        "tension": 0.15,
+                        "pointRadius": 3,
+                    },
+                    {
+                        "label": "Open ($)",
+                        "data": [r["ohlc"][0] if r.get("ohlc") else None for r in runs],
+                        "borderColor": "#94a3b8",
+                        "backgroundColor": "#94a3b833",
+                        "borderWidth": 1.5,
+                        "tension": 0.15,
+                        "pointRadius": 4,
+                    },
+                    {
+                        "label": "Close ($)",
+                        "data": [r["ohlc"][3] if r.get("ohlc") else None for r in runs],
+                        "borderColor": "#38bdf8",
+                        "backgroundColor": "#38bdf833",
+                        "borderWidth": 2.5,
+                        "tension": 0.15,
+                        "pointRadius": 5,
+                    },
+                ],
+            },
+            "options": {
+                "responsive": True,
+                "maintainAspectRatio": False,
+                "plugins": {
+                    "title": {
+                        "display": True,
+                        "text": "Exchange Trade Price OHLC per Run ($)",
+                        "color": "#f8fafc",
+                        "font": {"size": 16, "weight": "bold"},
+                    },
+                    "legend": {"labels": {"color": "#e2e8f0"}},
+                    "tooltip": {"callbacks": {}},
+                },
+                "scales": {
+                    "x": {"ticks": {"color": "#94a3b8"}, "grid": {"color": "#334155"}},
+                    "y": {
+                        "title": {"display": True, "text": "Price ($)", "color": "#94a3b8"},
+                        "ticks": {"color": "#94a3b8"},
+                        "grid": {"color": "#334155"},
+                    },
+                },
+            },
+        }
+
+    ohlc_box_html = (
+        '\n    <div class="chart-box" style="height: 360px; margin-top: 32px;">\n'
+        '      <canvas id="ohlcCanvas"></canvas>\n'
+        "    </div>"
+        if has_ohlc
+        else ""
+    )
+    ohlc_script_js = (
+        f"\n    const ohlcConfig = {json.dumps(ohlc_config)};\n"
+        "    ohlcConfig.options.plugins.tooltip.callbacks.label = function(context) {\n"
+        "      const val = context.parsed.y;\n"
+        "      return val == null ? '' : `${context.dataset.label}: $${val.toFixed(4)}`;\n"
+        "    };\n"
+        "    new Chart(document.getElementById('ohlcCanvas'), ohlcConfig);"
+        if has_ohlc
+        else ""
+    )
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>ITCH-OUCH Simulation: Profit Rate per ms</title>
+  <title>ITCH-OUCH Simulation: Profit Rate per ms & OHLC</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body {{
@@ -391,7 +502,7 @@ def render_html(runs, out_path):
   <div class="container">
     <div class="chart-box">
       <canvas id="chartCanvas"></canvas>
-    </div>
+    </div>{ohlc_box_html}
   </div>
   <script>
     const config = {json.dumps(chart_config)};
@@ -400,7 +511,7 @@ def render_html(runs, out_path):
       const valSec = val * 1000;
       return `${{context.dataset.label}}: ${{val >= 0 ? '+' : ''}}${{val.toFixed(5)}} $/ms (${{valSec >= 0 ? '+' : ''}}${{valSec.toFixed(2)}} $/s)`;
     }};
-    new Chart(document.getElementById('chartCanvas'), config);
+    new Chart(document.getElementById('chartCanvas'), config);{ohlc_script_js}
   </script>
 </body>
 </html>
