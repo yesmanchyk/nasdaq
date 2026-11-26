@@ -67,10 +67,25 @@ def load_data(csv_path):
                     "timestamp": ts,
                     "datetime": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
                     "duration_ms": dur_ms,
-                    "source": row["source"],
+                    "sources": set(),
                     "bots": {},
                 }
+            runs[ts]["sources"].add(row["source"])
+            if row["source"] != "cpp_bot":
+                runs[ts]["duration_ms"] = dur_ms
             runs[ts]["bots"][bot_id] = entry
+
+    # Normalize combined run sources (e.g., sim + cpp_bot -> "sim+cpp")
+    for run in runs.values():
+        srcs = run.pop("sources")
+        if "sim" in srcs and "cpp_bot" in srcs:
+            run["source"] = "sim+cpp"
+        elif "sim" in srcs:
+            run["source"] = "sim"
+        elif "gui_builtin" in srcs:
+            run["source"] = "gui_builtin"
+        else:
+            run["source"] = "+".join(sorted(srcs))
 
     # Sort runs chronologically
     sorted_runs = [runs[k] for k in sorted(runs.keys())]
@@ -78,17 +93,20 @@ def load_data(csv_path):
 
 
 def render_ascii_table(runs):
-    print("=" * 108)
-    print("  NASDAQ ITCH-OUCH HISTORICAL PERFORMANCE: PROFIT PER MILLISECOND ($/ms & $/s)")
-    print("=" * 108)
-    header = (
-        f"{'Run Date/Time':<20} | {'Source':<11} | {'Dur(ms)':<8} | "
-        f"{'Bot-1 $/ms':<13} | {'Bot-2 $/ms':<13} | {'Bot-3 $/ms':<13} | {'Bot-4 $/ms':<13}"
-    )
-    print(header)
-    print("-" * 108)
+    bot_ids = sorted({b for r in runs for b in r["bots"]}) or [1, 2, 3, 4, 5]
+    col_w = 22
+    header_parts = [f"{'Run Date/Time':<20}", f"{'Source':<11}", f"{'Dur(ms)':<8}"]
+    for b_id in bot_ids:
+        header_parts.append(f"{f'Bot-{b_id} $/ms':<{col_w}}")
+    header = " | ".join(header_parts)
+    sep_w = max(108, len(header))
 
-    bot_ids = [1, 2, 3, 4]
+    print("=" * sep_w)
+    print("  NASDAQ ITCH-OUCH HISTORICAL PERFORMANCE: PROFIT PER MILLISECOND ($/ms & $/s)")
+    print("=" * sep_w)
+    print(header)
+    print("-" * sep_w)
+
     bot_rates = {b: [] for b in bot_ids}
 
     for run in runs:
@@ -99,12 +117,13 @@ def render_ascii_table(runs):
                 rate_sec = run["bots"][b_id]["profit_per_sec"]
                 bot_rates[b_id].append(rate_ms)
                 sign = "+" if rate_ms >= 0 else ""
-                cols.append(f"{sign}{rate_ms:8.5f} (${rate_sec:+.2f}/s)")
+                cell = f"{sign}{rate_ms:8.5f} (${rate_sec:+.2f}/s)"
+                cols.append(f"{cell:<{col_w}}")
             else:
-                cols.append("      N/A      ")
+                cols.append(f"{'N/A':^{col_w}}")
         print(" | ".join(cols))
 
-    print("-" * 108)
+    print("-" * sep_w)
     print("AVERAGE PROFIT RATE ACROSS ALL RUNS:")
     for b_id in bot_ids:
         rates = bot_rates[b_id]
@@ -114,7 +133,7 @@ def render_ascii_table(runs):
             name = BOT_PALETTE.get(b_id, {}).get("label", f"Bot {b_id}")
             sign = "+" if avg_ms >= 0 else ""
             print(f"  • {name:<26}: {sign}{avg_ms:8.5f} $/ms  ({sign}{avg_sec:7.2f} $/s)")
-    print("=" * 108)
+    print("=" * sep_w)
 
 
 def render_svg(runs, out_path):
