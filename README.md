@@ -35,17 +35,37 @@ git submodule update --init --recursive
 
 ## Quick Start
 
-### 1. Rust Exchange, Bots & Desktop GUI (`itch-ouch-sim`)
+### 1. Run All Five Bots Together (`sim`)
+
+The all-in-one `sim` launcher starts the single-threaded Rust Exchange along with **all 5 competing bots** (each with an equal **$100,000.00** starting capital):
+- **Bot 1** (Rust): Market Maker + Mean Reversion
+- **Bot 2** (Rust): Momentum Sniper + Liquidity Taker
+- **Bot 3** (Rust): Smart Avellaneda-Stoikov MM + Microprice/OBI Alpha
+- **Bot 4** (Rust): Online Reinforcement Learning (Tabular Q-Learning MM + Contextual UCB1 Bandit)
+- **Bot 5** (C++20): Low-Latency `TradeEngine` (`cpp-trading-bot`, automatically discovered or built via CMake before trading starts)
 
 ```bash
-# Build all Rust binaries
-cargo build --manifest-path itch-ouch-sim/Cargo.toml --release
-
-# Launch the real-time GUI client (includes 1-click Built-in Sim)
-cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin itch_client
-
-# Or run the headless Exchange + 4 Rust bots + C++20 Bot 5 for 10 seconds
+# Run the Exchange + all 5 bots (4 Rust + 1 C++20) for 10 seconds
 cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin sim -- 10000
+
+# Optional: point Bot 5 to a specific binary (e.g., the C++20 Modules build)
+CPP_TRADING_BOT_BIN=cpp-trading-bot/build-modules/cpp_trading_bot \
+  cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin sim -- 10000
+
+# Optional: run only the 4 Rust bots (disable C++20 Bot 5)
+cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin sim -- 10000 --no-cpp
+```
+
+To launch the real-time desktop GUI terminal instead (includes a 1-click Built-in Sim):
+
+```bash
+cargo run --manifest-path itch-ouch-sim/Cargo.toml --release --bin itch_client
+```
+
+To plot historical profit-per-ms across all 5 bots from `itch-ouch-sim/sim_history/runs.csv`:
+
+```bash
+python3 itch-ouch-sim/scripts/plot_profit_per_ms.py --html
 ```
 
 ### 2. C++20 Low-Latency Trading Bot (`cpp-trading-bot`)

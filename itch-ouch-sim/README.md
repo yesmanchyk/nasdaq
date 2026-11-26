@@ -161,11 +161,14 @@ cargo run --release --bin itch_client
 ```
 > **Tip**: Click **`▶ Start Built-in Sim`** in the top bar to immediately spin up the Exchange and trading bots, or run standalone processes as shown below.
 
-### 3. Run the Combined Headless Simulation (`sim`)
+### 3. Run the Combined Headless Simulation (`sim` — All 5 Bots)
 
 ```bash
-# Run for 2000ms (default)
-cargo run --release --bin sim -- 2000
+# Run the Exchange + 4 Rust bots + C++20 Bot 5 for 10 seconds (default: 2000ms)
+cargo run --release --bin sim -- 10000
+
+# Run with Rust bots only (skip C++20 Bot 5)
+cargo run --release --bin sim -- 10000 --no-cpp
 ```
 
 ### 4. Run Standalone Processes in Separate Terminals
@@ -206,4 +209,9 @@ cargo run --release --bin bot -- --id 3 --duration-ms 5000
 **Terminal 6 — Start Bot 4 (Reinforcement Learning Tabular Q-Learning MM + Contextual UCB1 Bandit):**
 ```bash
 cargo run --release --bin bot -- --id 4 --duration-ms 5000
+```
+
+**Terminal 7 — Start Bot 5 (C++20 Low-Latency Trading Bot):**
+```bash
+../cpp-trading-bot/build/cpp_trading_bot --id 5 --duration-ms 5000 --history-csv sim_history/runs.csv
 ```
