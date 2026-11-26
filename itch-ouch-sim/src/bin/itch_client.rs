@@ -6,7 +6,7 @@
 //! - Interactive OUCH 5.0 Order Entry (Buy/Sell Limit Orders, Price & Quantity Steppers, Quick Presets)
 //! - Active Order Blotter with per-order Cancel and Cancel All buttons, Real-Time Position & MTM PnL
 //! - Live Time & Sales (Public Execution Tape) and PGM Multicast Reliability Telemetry
-//! - 1-Click Built-in Simulation Launcher (starts Exchange + 2 Bots and auto-connects OUCH)
+//! - 1-Click Built-in Simulation Launcher (starts Exchange + selectable Bots 1-5 including C++20 Bot 5 and auto-connects OUCH)
 //!
 //! Usage:
 //!   cargo run --release --bin itch_client
@@ -15,7 +15,10 @@
 
 use eframe::egui::{self, Color32, CornerRadius, FontId, RichText, Stroke, Vec2};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
-use itch_ouch_sim::bot::{BotState, ShadowBook, default_strategies_for_bot, spawn_bot};
+use itch_ouch_sim::bot::{
+    BotPnl, BotRunPerformance, BotState, INITIAL_BOT_CAPITAL_FP, RunOhlc, ShadowBook,
+    append_run_history_with_ohlc, default_strategies_for_bot, spawn_bot,
+};
 use itch_ouch_sim::exchange::ExchangeServer;
 use itch_ouch_sim::pgm::{
     DEFAULT_MCAST_GROUP, DEFAULT_MCAST_PORT, DEFAULT_NAK_ADDR, DEFAULT_OUCH_ADDR, PgmSubscriber,
@@ -25,7 +28,10 @@ use itch_ouch_sim::protocol::{
     write_frame,
 };
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -339,19 +345,305 @@ enum BottomTab {
     BotPnl,
 }
 
+/// Underlying live PnL source for a built-in simulation bot.
+enum SimBotSource {
+    Rust(Arc<BotState>),
+    Cpp(Arc<Mutex<BotPnl>>),
+}
+
 /// A built-in simulation bot tracked by the GUI for live PnL display
 struct SimBot {
-    state: Arc<BotState>,
+    bot_id: u64,
+    name: String,
+    color_idx: usize,
+    source: SimBotSource,
     /// (elapsed seconds since sim start, MTM PnL in dollars)
     pnl_history: Vec<[f64; 2]>,
 }
 
-const BOT_COLORS: [Color32; 4] = [
+impl SimBot {
+    fn pnl_snapshot(&self) -> BotPnl {
+        match &self.source {
+            SimBotSource::Rust(state) => state.pnl_snapshot(),
+            SimBotSource::Cpp(pnl) => pnl.lock().map(|g| *g).unwrap_or(BotPnl {
+                initial_capital_fp: INITIAL_BOT_CAPITAL_FP,
+                equity_fp: INITIAL_BOT_CAPITAL_FP,
+                cash_fp: INITIAL_BOT_CAPITAL_FP,
+                ..BotPnl::default()
+            }),
+        }
+    }
+}
+
+const BOT_COLORS: [Color32; 5] = [
     Color32::from_rgb(80, 190, 250),
     Color32::from_rgb(245, 190, 60),
     Color32::from_rgb(200, 120, 255),
     Color32::from_rgb(50, 225, 150),
+    Color32::from_rgb(255, 115, 125),
 ];
+
+const BOT_LABELS: [&str; 5] = [
+    "Bot-1 (MM + MeanRev)",
+    "Bot-2 (Mom + Taker)",
+    "Bot-3 (Smart AS+OBI)",
+    "Bot-4 (RL Q+Bandit)",
+    "Bot-5 (C++ LowLat)",
+];
+
+struct GuiCppBotHandle {
+    child: Child,
+    reader_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl GuiCppBotHandle {
+    fn stop_and_wait(mut self) {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            const SIGTERM: i32 = 15;
+            let pid = self.child.id() as i32;
+            if pid > 0 {
+                unsafe {
+                    kill(pid, SIGTERM);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn cpp_bot_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "cpp_trading_bot.exe"
+    } else {
+        "cpp_trading_bot"
+    }
+}
+
+/// Locates a compiled `cpp_trading_bot` binary or builds it on demand via CMake.
+fn resolve_cpp_bot_binary() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("CPP_TRADING_BOT_BIN")
+        && !explicit.trim().is_empty()
+    {
+        let p = PathBuf::from(explicit);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    let bin = cpp_bot_binary_name();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        PathBuf::from("cpp-trading-bot/build").join(bin),
+        PathBuf::from("cpp-trading-bot/build-modules").join(bin),
+        PathBuf::from("../cpp-trading-bot/build").join(bin),
+        PathBuf::from("../cpp-trading-bot/build-modules").join(bin),
+        manifest_dir.join("../cpp-trading-bot/build").join(bin),
+        manifest_dir
+            .join("../cpp-trading-bot/build-modules")
+            .join(bin),
+    ];
+
+    for path in &candidates {
+        if path.is_file() {
+            return Some(path.clone());
+        }
+    }
+
+    let cpp_src_dir = manifest_dir.join("../cpp-trading-bot");
+    if !cpp_src_dir.join("CMakeLists.txt").is_file() {
+        return None;
+    }
+    let cpp_build_dir = cpp_src_dir.join("build");
+    let configured = Command::new("cmake")
+        .arg("-S")
+        .arg(&cpp_src_dir)
+        .arg("-B")
+        .arg(&cpp_build_dir)
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !configured {
+        return None;
+    }
+    let built = Command::new("cmake")
+        .arg("--build")
+        .arg(&cpp_build_dir)
+        .arg("--target")
+        .arg("cpp_trading_bot")
+        .arg("-j")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !built {
+        return None;
+    }
+
+    let built_bin = cpp_build_dir.join(bin);
+    if built_bin.is_file() {
+        Some(built_bin)
+    } else {
+        None
+    }
+}
+
+/// Parses a `cpp_trading_bot` stdout summary line into a `BotPnl` snapshot.
+fn parse_cpp_summary_line(line: &str, mid_fp: u64) -> Option<BotPnl> {
+    if !line.contains("MTM PnL:") {
+        return None;
+    }
+    let mut acks = 0u64;
+    let mut cancels = 0u64;
+    let mut fills = 0u64;
+    let mut position = 0i64;
+    let mut equity_fp = INITIAL_BOT_CAPITAL_FP;
+    let mut mtm_pnl_fp = 0i64;
+    let mut parsed_pnl = false;
+
+    for part in line.split('|') {
+        let p = part.trim();
+        if let Some(v) = p.strip_prefix("Acks:") {
+            acks = v.trim().parse().unwrap_or(acks);
+        } else if let Some(v) = p.strip_prefix("Cancels:") {
+            cancels = v.trim().parse().unwrap_or(cancels);
+        } else if let Some(v) = p.strip_prefix("Fills:") {
+            fills = v.trim().parse().unwrap_or(fills);
+        } else if let Some(v) = p.strip_prefix("Pos:") {
+            let num = v.trim().trim_end_matches("sh").trim();
+            position = num.parse().unwrap_or(position);
+        } else if let Some(v) = p.strip_prefix("Equity:") {
+            let num = v.trim().trim_start_matches('$').trim();
+            if let Ok(dollars) = num.parse::<f64>() {
+                equity_fp = (dollars * PRICE_SCALE as f64).round() as i64;
+            }
+        } else if let Some(v) = p.strip_prefix("MTM PnL:") {
+            let num = v.trim().trim_start_matches('$').trim();
+            if let Ok(dollars) = num.parse::<f64>() {
+                mtm_pnl_fp = (dollars * PRICE_SCALE as f64).round() as i64;
+                parsed_pnl = true;
+            }
+        }
+    }
+
+    if !parsed_pnl {
+        return None;
+    }
+
+    let mark_fp = if mid_fp > 0 {
+        mid_fp
+    } else {
+        100 * PRICE_SCALE
+    };
+    let cash_fp = equity_fp - position * (mark_fp as i64);
+
+    Some(BotPnl {
+        initial_capital_fp: INITIAL_BOT_CAPITAL_FP,
+        position,
+        cash_fp,
+        mark_fp,
+        equity_fp,
+        mtm_pnl_fp,
+        fills,
+        acks,
+        cancels,
+        rl_q_updates: 0,
+        rl_bandit_updates: 0,
+    })
+}
+
+fn spawn_gui_cpp_bot(
+    bin_path: &Path,
+    ouch_addr: &str,
+    mcast_group: Ipv4Addr,
+    mcast_port: u16,
+    nak_addr: &str,
+    market_state: Arc<Mutex<SharedMarketState>>,
+) -> std::io::Result<(GuiCppBotHandle, Arc<Mutex<BotPnl>>)> {
+    let mut child = Command::new(bin_path)
+        .arg("--id")
+        .arg("5")
+        .arg("--ouch")
+        .arg(ouch_addr)
+        .arg("--mcast-group")
+        .arg(mcast_group.to_string())
+        .arg("--mcast-port")
+        .arg(mcast_port.to_string())
+        .arg("--nak")
+        .arg(nak_addr)
+        .arg("--duration-ms")
+        .arg("0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pnl_state = Arc::new(Mutex::new(BotPnl {
+        initial_capital_fp: INITIAL_BOT_CAPITAL_FP,
+        equity_fp: INITIAL_BOT_CAPITAL_FP,
+        cash_fp: INITIAL_BOT_CAPITAL_FP,
+        mark_fp: 100 * PRICE_SCALE,
+        ..BotPnl::default()
+    }));
+
+    let stdout = child.stdout.take();
+    let pnl_clone = Arc::clone(&pnl_state);
+    let reader_thread = stdout.map(|out| {
+        thread::Builder::new()
+            .name("gui-cpp-bot-stdout".into())
+            .spawn(move || {
+                let reader = BufReader::new(out);
+                for line in reader.lines().map_while(Result::ok) {
+                    let mid_fp = market_state
+                        .lock()
+                        .map(|st| st.book.mid_price())
+                        .unwrap_or(100 * PRICE_SCALE);
+                    if let Some(snap) = parse_cpp_summary_line(&line, mid_fp)
+                        && let Ok(mut guard) = pnl_clone.lock()
+                    {
+                        *guard = snap;
+                    }
+                }
+            })
+            .expect("spawn gui-cpp-bot-stdout reader")
+    });
+
+    Ok((
+        GuiCppBotHandle {
+            child,
+            reader_thread,
+        },
+        pnl_state,
+    ))
+}
 
 struct ItchGuiApp {
     state: Arc<Mutex<SharedMarketState>>,
@@ -384,7 +676,10 @@ struct ItchGuiApp {
     show_trade_markers: bool,
     paused: bool,
     bottom_tab: BottomTab,
+    selected_bots: [bool; 5],
     demo_sim_running: Option<Arc<AtomicBool>>,
+    sim_exchange_thread: Option<thread::JoinHandle<ExchangeServer>>,
+    cpp_bot_handle: Option<GuiCppBotHandle>,
     status_msg: String,
 
     // Built-in simulation bots (kept after stop so final PnL stays visible)
@@ -426,7 +721,10 @@ impl ItchGuiApp {
             show_trade_markers: true,
             paused: false,
             bottom_tab: BottomTab::OrdersAndPosition,
+            selected_bots: [true; 5],
             demo_sim_running: None,
+            sim_exchange_thread: None,
+            cpp_bot_handle: None,
             status_msg: "Listening on PGM Multicast".to_string(),
             sim_bots: Vec::new(),
             sim_started_at: None,
@@ -442,29 +740,52 @@ impl ItchGuiApp {
 
     fn toggle_builtin_sim(&mut self) {
         if let Some(flag) = self.demo_sim_running.take() {
+            // Stop the C++20 bot cleanly first so it prints [C++ BOT FINAL] while exchange is still closing
+            if let Some(cpp_handle) = self.cpp_bot_handle.take() {
+                cpp_handle.stop_and_wait();
+            }
             flag.store(false, Ordering::Relaxed);
+            let run_ohlc = self
+                .sim_exchange_thread
+                .take()
+                .and_then(|h| h.join().ok())
+                .and_then(|ex| ex.stats.ohlc().map(RunOhlc::from));
+
             // Take one last PnL sample so the final result is on the chart
             self.sample_bot_pnl(true);
-            let stopped_s = self.sim_started_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let stopped_s = self
+                .sim_started_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
             self.sim_stopped_after_s = Some(stopped_s);
 
-            let perf_records: Vec<itch_ouch_sim::bot::BotRunPerformance> = self
+            let perf_records: Vec<BotRunPerformance> = self
                 .sim_bots
                 .iter()
-                .enumerate()
-                .map(|(idx, b)| itch_ouch_sim::bot::BotRunPerformance {
-                    bot_id: (idx + 1) as u64,
-                    name: b.state.name.clone(),
-                    pnl: b.state.pnl_snapshot(),
+                .map(|b| BotRunPerformance {
+                    bot_id: b.bot_id,
+                    name: b.name.clone(),
+                    pnl: b.pnl_snapshot(),
                 })
                 .collect();
             let duration_ms = (stopped_s * 1000.0).round() as u64;
-            let hist_suffix = match itch_ouch_sim::bot::append_run_history("gui_builtin", duration_ms, &perf_records) {
-                Ok(p) => format!(" — saved to {}", p.display()),
-                Err(_) => String::new(),
+            let hist_suffix = if perf_records.is_empty() {
+                String::new()
+            } else {
+                match append_run_history_with_ohlc(
+                    "gui_builtin",
+                    duration_ms,
+                    &perf_records,
+                    run_ohlc,
+                ) {
+                    Ok(p) => format!(" — saved to {}", p.display()),
+                    Err(_) => String::new(),
+                }
             };
 
-            self.status_msg = format!("Stopped built-in simulation — final bot PnL in 🤖 BOT PnL tab{hist_suffix}");
+            self.status_msg = format!(
+                "Stopped built-in simulation — final bot PnL in 🤖 BOT PnL tab{hist_suffix}"
+            );
             self.bottom_tab = BottomTab::BotPnl;
             return;
         }
@@ -474,6 +795,18 @@ impl ItchGuiApp {
         let nak_addr = self.nak_addr.clone();
         let running = Arc::new(AtomicBool::new(true));
         let sim_flag = Arc::clone(&running);
+
+        // Resolve (or build via CMake) the C++20 bot binary before starting the exchange
+        // so Rust bots do not trade ahead of Bot 5 during a cold build.
+        let cpp_bin = if self.selected_bots[4] {
+            resolve_cpp_bot_binary()
+        } else {
+            None
+        };
+        let mut cpp_warning: Option<String> = None;
+        if self.selected_bots[4] && cpp_bin.is_none() {
+            cpp_warning = Some("C++20 Bot 5 binary not found".to_string());
+        }
 
         match ExchangeServer::bind("127.0.0.1:0", mcast_group, mcast_port, &nak_addr) {
             Ok(mut exchange) => {
@@ -485,15 +818,20 @@ impl ItchGuiApp {
                     }
                 };
                 let ex_run = Arc::clone(&running);
-                thread::Builder::new()
+                self.sim_exchange_thread = thread::Builder::new()
                     .name("gui-exchange".into())
                     .spawn(move || {
                         exchange.run(ex_run);
+                        exchange
                     })
                     .ok();
 
                 self.sim_bots.clear();
                 for bot_id in 1..=4u64 {
+                    let idx = (bot_id - 1) as usize;
+                    if !self.selected_bots[idx] {
+                        continue;
+                    }
                     let (name, strats) = default_strategies_for_bot(bot_id);
                     match spawn_bot(
                         name,
@@ -507,7 +845,10 @@ impl ItchGuiApp {
                     ) {
                         // Threads are detached; we only keep the shared state for PnL display
                         Ok(handle) => self.sim_bots.push(SimBot {
-                            state: Arc::clone(&handle.state),
+                            bot_id,
+                            name: handle.state.name.clone(),
+                            color_idx: idx,
+                            source: SimBotSource::Rust(Arc::clone(&handle.state)),
                             pnl_history: Vec::new(),
                         }),
                         Err(e) => {
@@ -515,14 +856,43 @@ impl ItchGuiApp {
                         }
                     }
                 }
+
+                if let Some(ref bin_path) = cpp_bin {
+                    match spawn_gui_cpp_bot(
+                        bin_path,
+                        &ouch_addr,
+                        mcast_group,
+                        mcast_port,
+                        &nak_addr,
+                        Arc::clone(&self.state),
+                    ) {
+                        Ok((handle, pnl_state)) => {
+                            self.cpp_bot_handle = Some(handle);
+                            self.sim_bots.push(SimBot {
+                                bot_id: 5,
+                                name: BOT_LABELS[4].to_string(),
+                                color_idx: 4,
+                                source: SimBotSource::Cpp(pnl_state),
+                                pnl_history: Vec::new(),
+                            });
+                        }
+                        Err(e) => {
+                            cpp_warning = Some(format!("failed to launch C++ Bot 5: {e}"));
+                        }
+                    }
+                }
+
                 self.sim_started_at = Some(Instant::now());
                 self.sim_stopped_after_s = None;
 
                 self.demo_sim_running = Some(sim_flag);
                 self.ouch_addr = ouch_addr.clone();
                 let _ = self.ouch_client.connect(&ouch_addr);
+                let warn_suffix = cpp_warning
+                    .map(|w| format!(" ({w})"))
+                    .unwrap_or_default();
                 self.status_msg = format!(
-                    "Built-in Exchange + {} Bots running on {ouch_addr}",
+                    "Built-in Exchange + {} Bots running on {ouch_addr}{warn_suffix}",
                     self.sim_bots.len()
                 );
             }
@@ -547,7 +917,7 @@ impl ItchGuiApp {
                 .last()
                 .is_none_or(|last| t - last[0] >= 0.1);
             if force || due {
-                let pnl = bot.state.pnl_snapshot().mtm_pnl_fp as f64 / PRICE_SCALE as f64;
+                let pnl = bot.pnl_snapshot().mtm_pnl_fp as f64 / PRICE_SCALE as f64;
                 bot.pnl_history.push([t, pnl]);
             }
         }
@@ -558,8 +928,8 @@ impl ItchGuiApp {
             ui.add_space(12.0);
             ui.label(
                 RichText::new(
-                    "No built-in bots yet. Click ▶ Start Built-in Sim to run the Exchange + 4 Bots \
-                     and track how much money each bot makes.",
+                    "No built-in bots yet. Select bots in the top bar and click ▶ Start Built-in Sim \
+                     to run the Exchange + selected Bots (including C++20 Bot 5) and track live PnL.",
                 )
                 .color(muted),
             );
@@ -588,18 +958,17 @@ impl ItchGuiApp {
         };
 
         // Rank bots by PnL (best first)
-        let mut rows: Vec<(usize, &SimBot, itch_ouch_sim::bot::BotPnl)> = self
+        let mut rows: Vec<(&SimBot, BotPnl)> = self
             .sim_bots
             .iter()
-            .enumerate()
-            .map(|(i, b)| (i, b, b.state.pnl_snapshot()))
+            .map(|b| (b, b.pnl_snapshot()))
             .collect();
-        rows.sort_by(|a, b| b.2.mtm_pnl_fp.cmp(&a.2.mtm_pnl_fp));
-        let total_fp: i64 = rows.iter().map(|r| r.2.mtm_pnl_fp).sum();
+        rows.sort_by(|a, b| b.1.mtm_pnl_fp.cmp(&a.1.mtm_pnl_fp));
+        let total_fp: i64 = rows.iter().map(|r| r.1.mtm_pnl_fp).sum();
 
         let init_cap_dollars = rows
             .first()
-            .map(|r| r.2.initial_capital_fp as f64 / PRICE_SCALE as f64)
+            .map(|r| r.1.initial_capital_fp as f64 / PRICE_SCALE as f64)
             .unwrap_or(itch_ouch_sim::bot::INITIAL_BOT_CAPITAL_DOLLARS as f64);
 
         ui.columns(2, |cols| {
@@ -637,8 +1006,8 @@ impl ItchGuiApp {
                     }
                     ui.end_row();
 
-                    for (rank, (idx, bot, p)) in rows.iter().enumerate() {
-                        let color = BOT_COLORS[*idx % BOT_COLORS.len()];
+                    for (rank, (bot, p)) in rows.iter().enumerate() {
+                        let color = BOT_COLORS[bot.color_idx % BOT_COLORS.len()];
                         let start_cap = p.initial_capital_fp as f64 / PRICE_SCALE as f64;
                         let equity = p.equity_fp as f64 / PRICE_SCALE as f64;
                         let pnl = p.mtm_pnl_fp as f64 / PRICE_SCALE as f64;
@@ -656,7 +1025,7 @@ impl ItchGuiApp {
                             _ => "",
                         };
                         ui.label(RichText::new(format!("{medal}{}", rank + 1)).strong());
-                        ui.label(RichText::new(bot.state.name.trim()).strong().color(color));
+                        ui.label(RichText::new(bot.name.trim()).strong().color(color));
                         ui.label(
                             RichText::new(format!("${start_cap:.2}"))
                                 .monospace()
@@ -715,14 +1084,14 @@ impl ItchGuiApp {
                 .y_axis_label("PnL ($)")
                 .x_axis_label("sim time (s)")
                 .show(ui, |plot_ui| {
-                    for (i, bot) in self.sim_bots.iter().enumerate() {
+                    for bot in &self.sim_bots {
                         if bot.pnl_history.is_empty() {
                             continue;
                         }
                         plot_ui.line(
                             Line::new(PlotPoints::new(bot.pnl_history.clone()))
-                                .name(bot.state.name.trim())
-                                .color(BOT_COLORS[i % BOT_COLORS.len()])
+                                .name(bot.name.trim())
+                                .color(BOT_COLORS[bot.color_idx % BOT_COLORS.len()])
                                 .width(2.0_f32),
                         );
                     }
@@ -924,6 +1293,9 @@ impl ItchGuiApp {
 
 impl Drop for ItchGuiApp {
     fn drop(&mut self) {
+        if let Some(cpp_handle) = self.cpp_bot_handle.take() {
+            cpp_handle.stop_and_wait();
+        }
         if let Some(flag) = self.demo_sim_running.take() {
             flag.store(false, Ordering::Relaxed);
         }
@@ -1014,12 +1386,16 @@ impl eframe::App for ItchGuiApp {
                     );
                     ui.separator();
 
+                    let selected_count = self.selected_bots.iter().filter(|&&b| b).count();
                     let sim_btn_label = if self.demo_sim_running.is_some() {
                         RichText::new("⏹ Stop Built-in Sim").color(red).strong()
                     } else {
-                        RichText::new("▶ Start Built-in Sim (Exchange + 4 Bots)")
-                            .color(green)
-                            .strong()
+                        let bot_word = if selected_count == 1 { "Bot" } else { "Bots" };
+                        RichText::new(format!(
+                            "▶ Start Built-in Sim (Exchange + {selected_count} {bot_word})"
+                        ))
+                        .color(green)
+                        .strong()
                     };
                     if ui.button(sim_btn_label).clicked() {
                         self.toggle_builtin_sim();
@@ -1038,6 +1414,34 @@ impl eframe::App for ItchGuiApp {
 
                     ui.separator();
                     ui.label(RichText::new(&self.status_msg).small().color(cyan));
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let can_edit = self.demo_sim_running.is_none();
+                    ui.label(RichText::new("SIM BOTS:").small().strong().color(muted));
+                    ui.add_enabled_ui(can_edit, |ui| {
+                        for (i, label) in BOT_LABELS.iter().enumerate() {
+                            ui.checkbox(
+                                &mut self.selected_bots[i],
+                                RichText::new(*label).small().color(BOT_COLORS[i]),
+                            );
+                        }
+                        if ui.small_button("All").clicked() {
+                            self.selected_bots = [true; 5];
+                        }
+                        if ui.small_button("None").clicked() {
+                            self.selected_bots = [false; 5];
+                        }
+                    });
+                    if !can_edit {
+                        ui.label(
+                            RichText::new("(stop sim to change selection)")
+                                .small()
+                                .italics()
+                                .color(muted),
+                        );
+                    }
                 });
 
                 ui.add_space(6.0);
@@ -1507,7 +1911,7 @@ impl eframe::App for ItchGuiApp {
                         let best = self
                             .sim_bots
                             .iter()
-                            .map(|b| b.state.pnl_snapshot().mtm_pnl_fp)
+                            .map(|b| b.pnl_snapshot().mtm_pnl_fp)
                             .max()
                             .unwrap_or(0);
                         format!("🤖 BOT PnL (best ${:+.0})", best as f64 / PRICE_SCALE as f64)
@@ -2318,5 +2722,24 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_parse_cpp_summary_line() {
+        let line = "t=400ms | [Bot-5 (C++ LowLat)] PGM_ITCH:  540 (RDATA:0/NAK:0) | Acks:   12 | Cancels:    8 | Fills:   95 | Pos:  +120 sh | Equity: $ 100042.50 | MTM PnL: $   +42.50";
+        let snap = parse_cpp_summary_line(line, 100 * PRICE_SCALE).expect("should parse");
+        assert_eq!(snap.acks, 12);
+        assert_eq!(snap.cancels, 8);
+        assert_eq!(snap.fills, 95);
+        assert_eq!(snap.position, 120);
+        assert_eq!(snap.equity_fp, 1_000_425_000);
+        assert_eq!(snap.mtm_pnl_fp, 425_000);
+        assert_eq!(snap.cash_fp, 1_000_425_000 - 120 * 1_000_000);
+
+        let final_line = "[C++ BOT FINAL] [Bot-5 (C++ LowLat)] PGM_ITCH: 2000 (RDATA:0/NAK:0) | Acks:  655 | Cancels:  375 | Fills:  785 | Pos:  -563 sh | Equity: $  99846.54 | MTM PnL: $  -153.46";
+        let snap2 = parse_cpp_summary_line(final_line, 100 * PRICE_SCALE).expect("should parse");
+        assert_eq!(snap2.position, -563);
+        assert_eq!(snap2.equity_fp, 998_465_400);
+        assert_eq!(snap2.mtm_pnl_fp, -1_534_600);
     }
 }
